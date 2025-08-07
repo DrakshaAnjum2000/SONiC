@@ -1,0 +1,133 @@
+testbed:
+    name: Sonic
+    alias: Sonic
+    credentials:
+        default:
+            username: admin
+            password: admin
+        enable:
+            password: admin    
+
+devices:
+    sonic:
+        os: sonic
+        type: Nexus-C3432D-48x200G-32x100G
+        alias: uut1
+        credentials:
+            default:
+                username: admin
+                password: admin
+        connections:
+            defaults:
+                class: 'unicon.Unicon'
+            a:
+              protocol: telnet
+              ip: 10.104.219.15
+              port: 2003
+            # alt:
+            #    protocol: ssh
+            #    ip: 10.104.217.12
+
+    UF2:
+        os: sonic
+        type: Nexus-C3432D-48x200G-32x100G
+        alias: uut2
+        credentials:
+             default:
+                 username: admin
+                 password: admin
+        connections:
+            defaults:
+                 class: 'unicon.Unicon'
+            a:
+              protocol: telnet
+              ip: 10.104.219.15
+              port: 2006
+            # alt:
+            #    protocol: ssh
+            #    ip: 10.104.217.28
+        custom:   
+            firmware:
+                vega_fw_version: "1.79.2492"  
+                                            
+topology:
+    #Spine2
+    uut1:
+        interfaces:
+            # #400G- retimer-> 1 => Traffic
+            # Ethernet0:
+            #     alias: uut1_int1
+            #     link: uut1_int1
+            #     type: ethernet
+            #400G- retimer-> 2
+            Ethernet8:
+                alias: uut1_int1
+                link: uut1_int1
+                type: ethernet
+            #400G - retimer -> 3   
+            Ethernet16:
+                alias: uut1_int2
+                link: uut1_int2
+                type: ethernet
+            #retimer -> 10
+            Ethernet72:
+                alias: uut1_int3
+                link: uut1_int3
+                type: ethernet
+            # #400G- non-retimer ->24
+            Ethernet184:
+                alias: uut1_int4
+                link: uut1_int4
+                type: ethernet
+            # #400G - retimer -> 31  
+            Ethernet240:
+                alias: uut1_int5
+                link: uut1_int5
+                type: ethernet
+            #400G - retimer -> 32  
+            Ethernet248:
+                alias: uut1_int6
+                link: uut1_int6
+                type: ethernet
+    #FAB2
+    uut2: 
+        interfaces:
+            #400G retimer -> 2
+            Ethernet8:
+                alias: uut2_int1
+                link: uut2_int1
+                type: ethernet
+            #400G non-retimer -> 7
+            Ethernet48:
+                alias: uut2_int2
+                link: uut2_int2
+                type: ethernet
+            #non-retimer -> 9
+            Ethernet64:
+                alias: uut2_int3
+                link: uut2_int3
+                type: Ethernet
+            #400G- non-retimer -> 24
+            Ethernet184:
+                alias: uut2_int4
+                link: uut2_int4
+                type: ethernet
+            #400G- non-retimer -> 25
+            Ethernet192:
+                alias: uut2_int5
+                link: uut2_int5
+                type: ethernet    
+            # #400G - retimer -> 31  
+            Ethernet240:
+                alias: uut2_int6
+                link: uut2_int6
+                type: ethernet
+            # # #400G - retimer  -> 32  => traffic
+            # Ethernet248:
+            #     alias: uut2_int8
+            #     link: uut2_int8
+            #     type: ethernet    
+
+
+            
+ 

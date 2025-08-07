@@ -1,0 +1,5 @@
+rom pyats.easypy import run
+
+
+def main():
+    run(testscript = '/ws/danjum-bgl/Sonic/sonic_testcase.py') 
