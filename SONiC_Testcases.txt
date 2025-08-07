@@ -1,0 +1,4043 @@
+import os
+from pyats import topology
+from pyats.topology import loader
+import logging
+import re
+# from genie.utils import banner
+from unicon.eal.dialogs import Statement, Dialog
+from pyats import aetest
+from datetime import datetime
+from collections import defaultdict
+import sys
+import time
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+import pdb
+class mypdb(pdb.Pdb):
+    def interaction(self, *args, **kwargs):
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open('/dev/stdin')
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin 
+
+######################################################################
+#####                           LIBRARIES                       ######
+######################################################################
+
+def show_version(uut1):
+    logger.info("Executing 'show version'")
+    uut1.execute("show version", timeout=60)
+    match = re.search(r"SONiC Software Version: (.+)", output)
+    if match:
+        logger.info(f"Detected SONiC Version: {match.group(1)}")
+
+def enter_root_shell(uut1):
+    logger.info("Entering sudo bash...")
+    uut1.sendline("sudo bash")
+    uut1.expect(r"root@.*#")
+
+def exit_root_shell(uut1):
+    logger.info("Exiting sudo bash...")
+    uut1.sendline("exit")
+    uut1.expect(r"admin@.*\$")
+
+def clean_number(num_str):
+    return int(num_str.replace(",", "").strip())
+
+
+def parse_counters(output):
+    """
+    Parse the output of 'show interface counters' and return a dictionary with RX_OK and TX_OK.
+    """
+    counters = {}
+    lines = output.splitlines()
+    header_found = False
+
+    for line in lines:
+        if re.match(r'^\s*IFACE\s+', line):
+            header_found = True
+            continue
+        if not header_found or not line.strip():
+            continue
+
+        #for matching the lines in TX/RX
+        match = re.match(r'^\s*(Ethernet\d+)\s+\S+\s+([\d,]+)\s+.*?\s+([\d,]+)\s+', line)
+        if match:
+            iface = match.group(1)
+            rx_ok = clean_number(match.group(2))
+            tx_ok = clean_number(match.group(3))
+            counters[iface] = {
+                'rx_ok': rx_ok,
+                'tx_ok': tx_ok
+            }
+
+    return counters
+
+def check_interface_status(uut1):
+    logger.info("Checking interface status")
+    output = uut1.execute("show interfaces status | grep up | wc -l")
+    return int(output.strip())    
+
+def interface_list(uut1, uut1_int1, uut1_int2, interface_list, min_delta=1000, detailed_check=False):
+    logger.info("Collecting initial interface counters...")
+    if detailed_check:
+        before = {}
+        for intf in interface_list:
+            output = uut1.execute(f'show interface counters -i "{intf}"')
+            before[intf] = parse_counters(output).get(intf, {})
+    else:
+        before = parse_counters(uut1.execute("show interface counters"))
+
+    time.sleep(30)
+
+    logger.info("Collecting post-wait interface counters...")
+    if detailed_check:
+        after = {}
+        for intf in interface_list:
+            output = uut1.execute(f'show interface counters -i "{intf}"')
+            after[intf] = parse_counters(output).get(intf, {})
+    else:
+        after = parse_counters(uut1.execute("show interface counters"))
+
+    all_good = True
+    for intf in interface_list:
+        rx1 = int(before.get(intf, {}).get('rx_ok', 0))
+        tx1 = int(before.get(intf, {}).get('tx_ok', 0))
+        rx2 = int(after.get(intf, {}).get('rx_ok', 0))
+        tx2 = int(after.get(intf, {}).get('tx_ok', 0))
+
+        delta_rx = rx2 - rx1
+        delta_tx = tx2 - tx1
+
+        logger.info(
+            f"[{intf}] RX: {rx1:,} → {rx2:,} (Δ={delta_rx:,}) | "
+            f"TX: {tx1:,} → {tx2:,} (Δ={delta_tx:,})"
+        )
+
+        if delta_rx < min_delta or delta_tx < min_delta:
+            logger.warning(f"{intf} failed min traffic threshold. RX: {delta_rx}, TX: {delta_tx}")
+            all_good = False
+
+    return all_good
+
+
+def flap_and_check(uut1, uut1_int1, uut1_int2, interface_list, iterations=100):
+    logger.info(f"Flapping interfaces {iterations} times and checking traffic...")
+
+    enter_root_shell(uut1)
+
+    for i in range(iterations):
+        logger.info(f"--- Flap Iteration {i+1} ---")
+        for intf in interface_list:
+            uut1.sendline(f"config interface shutdown {intf}")
+            uut1.expect("#")
+            time.sleep(2)
+
+            uut1.sendline(f"config interface startup {intf}")
+            uut1.expect("#")
+            time.sleep(5)
+
+    exit_root_shell(uut1)
+
+    return check_interface_traffic(uut1, interface_list)
+
+def check_interface_traffic(uut1, uut1_int1, uut1_int2, interface_list):
+    for intf in interface_list:
+        output = uut1.execute(f"show interface {intf} counters")  
+        if "0 packets" in output:  
+            logger.error(f"Traffic check failed on {intf}")
+            return False
+    logger.info("Traffic check passed")
+    return True
+
+def check_error_counters(uut1):
+    logger.info("Checking error counters")
+    return uut1.execute("show interfaces counters errors")
+
+def reboot_device(uut1):
+    logger.info("Rebooting device")
+    uut1.execute("reboot")
+    time.sleep(120)  
+
+def warm_reboot(uut1):
+    logger.info("Performing warm reboot")
+    uut1.execute("warm-reboot")
+    time.sleep(180)
+
+
+def check_lldp_neighbors(uut1):
+    logger.info("Checking LLDP neighbors")
+    return uut1.execute("show lldp neighbors")
+
+# Normalize data for comparison
+def normalize(eeprom_str):
+    """Extract stable fields for EEPROM comparison."""
+    fields_to_check = ["Serial Number", "Vendor", "Part Number"]
+    normalized = []
+
+    for line in eeprom_str.splitlines():
+        for field in fields_to_check:
+            if field in line:
+                # Normalize whitespace and format
+                normalized.append(re.sub(r'\s+', ' ', line.strip()))
+    return "\n".join(sorted(normalized))
+
+def normalize(version_str):
+    # Removes extra spaces, tabs, etc. Also remove time/date lines if necessary.
+    return re.sub(r'\s+', ' ', version_str.strip())
+
+def extract_version(text):
+    # Adjust regex based on your actual device output
+    match = re.search(r'Version\s*:\s*(\S+)', text)
+    return match.group(1) if match else None
+    pre_ver = extract_version(pre_version)
+    post_ver = extract_version(post_version)        
+
+def check_link_flap(uut1, uut1_int1, uut1_int2, intf):
+    enter_root_shell(uut1)
+
+    logger.info(f"Performing link flap on {intf}")
+    uut1.sendline(f"config interface shutdown {intf}")
+    uut1.expect("#")
+    time.sleep(5)
+
+    uut1.sendline(f"config interface startup {intf}")
+    uut1.expect("#")
+    time.sleep(5)
+
+    output = uut1.execute(f"show interfaces status {intf}")
+
+    exit_root_shell(uut1)
+
+    return output
+
+def check_eeprom(uut1, uut1_int1, uut1_int2, intf):
+    logger.info("Checking EEPROM...")
+    uut1.execute(f"config interface shutdown {intf}")
+    time.sleep(5)
+    uut1.execute(f"config interface startup {intf}")
+    time.sleep(5)
+    return uut1.execute(f"show platform syseeprom")
+
+############################COMMON SETUP SECTION ##################
+
+class common_setup(aetest.CommonSetup):
+    """ Common Setup section """
+
+    @aetest.subsection
+    def connect(self, testscript, testbed):
+        uut1 = testbed.devices['uut1']
+        uut2 = testbed.devices['uut2'] 
+       
+        uut1.connect()
+        uut2.connect()     
+
+        uut1_int1 = uut1.interfaces['uut1_int1'].name
+        uut1_int2 = uut1.interfaces['uut1_int2'].name
+        uut1_int3 = uut1.interfaces['uut1_int3'].name
+        uut1_int4 = uut1.interfaces['uut1_int4'].name
+        uut1_int5 = uut1.interfaces['uut1_int5'].name
+        uut1_int6 = uut1.interfaces['uut1_int6'].name
+        # uut1_int7 = uut1.interfaces['uut1_int7'].name
+        # uut1_int8 = uut1.interfaces['uut1_int8'].name
+        # uut1_int9 = uut1.interfaces['uut1_int9'].name
+        
+
+        uut2_int1 = uut2.interfaces['uut2_int1'].name
+        uut2_int2 = uut2.interfaces['uut2_int2'].name
+        uut2_int3 = uut2.interfaces['uut2_int3'].name
+        uut2_int4 = uut2.interfaces['uut2_int4'].name
+        uut2_int5 = uut2.interfaces['uut2_int5'].name
+        uut2_int6 = uut2.interfaces['uut2_int6'].name
+        # uut2_int7 = uut2.interfaces['uut2_int7'].name
+        # uut2_int8 = uut2.interfaces['uut2_int8'].name
+        # uut2_int9 = uut2.interfaces['uut2_int9'].name
+       
+        testscript.parameters['uut1'] = uut1
+        testscript.parameters['uut2'] = uut2
+
+
+        testscript.parameters['uut1_int1'] = uut1_int1
+        testscript.parameters['uut1_int2'] = uut1_int2
+        testscript.parameters['uut1_int3'] = uut1_int3
+        testscript.parameters['uut1_int4'] = uut1_int4
+        testscript.parameters['uut1_int5'] = uut1_int5
+        testscript.parameters['uut1_int6'] = uut1_int6
+        # testscript.parameters['uut1_int7'] = uut1_int7
+        # testscript.parameters['uut1_int8'] = uut1_int8
+        # testscript.parameters['uut1_int9'] = uut1_int9
+        
+       
+        testscript.parameters['uut2_int1'] = uut2_int1
+        testscript.parameters['uut2_int2'] = uut2_int2
+        testscript.parameters['uut2_int3'] = uut2_int3
+        testscript.parameters['uut2_int4'] = uut2_int4
+        testscript.parameters['uut2_int5'] = uut2_int5
+        testscript.parameters['uut2_int6'] = uut2_int6
+        # testscript.parameters['uut2_int7'] = uut2_int7
+        # testscript.parameters['uut2_int8'] = uut2_int8
+        # testscript.parameters['uut2_int9'] = uut2_int9
+        
+    
+###################################################################
+###                     TESTCASES SECTION                       ###
+################################################################### 
+
+
+############################### TESTCASE 13 ###########################################################
+
+# @aetest.skip
+class TC13_Checking_Longevity_Test(aetest.Testcase):
+
+    @aetest.test
+    def checking_longetivity_test(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6):
+        interface_list_uut1 = [uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6]
+
+        # # Let's assume 'shell' works and leads to 'admin@.*\\$' prompt.
+        # logger.info("Attempting to transition from IVM-R> to Linux shell on UUT1")
+        # uut1.sendline("shell") # Replace 'shell' with the actual command that works on your device
+        # uut1.expect("admin@.*\\$") # Expect the admin shell prompt after 'shell' command
+        # logger.info("Successfully transitioned to Linux admin shell on UUT1")
+        # # --- End of IVM-R> transition ---
+
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        logger.info("Performing PRE-CHECKS...")
+
+        # Version Check
+        pre_version_output = uut1.execute("show version")
+        pre_version_match = re.search(r"SONiC Software Version:\s*(\S+)", pre_version_output)
+        if not pre_version_match:
+            self.failed("Failed to detect SONiC version in pre-check")
+        pre_version = pre_version_match.group(1)
+        logger.info(f"Pre-Check Version: {pre_version}")
+
+        # SKU Detection
+        pre_sku_output = uut1.execute("show platform summary")
+        pre_sku_match = re.search(r"HwSKU:\s*(\S+)", pre_sku_output)
+        if not pre_sku_match:
+            self.failed("Failed to detect SKU in pre-check")
+        pre_sku = pre_sku_match.group(1)
+        logger.info(f"Pre-Check SKU: {pre_sku}")
+
+        # Interface Status
+        pre_interface_status = uut1.execute("show interface status")
+        pre_up_count, pre_down_count = 0, 0
+        for line in pre_interface_status.splitlines():
+            if "Ethernet" in line:
+                fields = line.split()
+                if len(fields) >= 8 and fields[7].lower() == "up":
+                    pre_up_count += 1
+                elif len(fields) >= 8 and fields[7].lower() == "down":
+                    pre_down_count += 1
+        logger.info(f"Pre-Check Interface Status: {pre_up_count} UP, {pre_down_count} DOWN")
+
+
+        # Step: Check BPS values are increasing for 'grep U' and 'grep D'
+        logger.info("Capturing initial BPS values for 'grep U' and 'grep D'")
+        pre_initial_bps_output_u = uut1.execute("show interface counters | grep U")
+        pre_initial_bps_output_d = uut1.execute("show interface counters | grep D")
+
+        time.sleep(60)
+        logger.info("Capturing BPS values after wait for 'grep U' and 'grep D'")
+        pre_later_bps_output_u = uut1.execute("show interface counters | grep U")
+        pre_later_bps_output_d = uut1.execute("show interface counters | grep D")
+
+        # Parse initial BPS for 'grep U'
+        initial_bps_u = {}
+        for line in pre_initial_bps_output_u.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                pre_rx_bps = float(parts[8])
+                pre_tx_bps = float(parts[9])
+                initial_bps_u[iface] = (pre_rx_bps, pre_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+        # Parse initial BPS for 'grep D'
+        initial_bps_d = {}
+        for line in pre_initial_bps_output_d.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                pre_rx_bps = float(parts[8])
+                pre_tx_bps = float(parts[9])
+                initial_bps_d[iface] = (pre_rx_bps, pre_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep D': {line}")
+
+        # Parse later BPS for 'grep U'
+        later_bps_u = {}
+        for line in pre_later_bps_output_u.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                later_rx_bps = float(parts[8])
+                later_tx_bps = float(parts[9])
+                later_bps_u[iface] = (later_rx_bps, later_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+        # Parse later BPS for 'grep D'
+        later_bps_d = {}
+        for line in pre_later_bps_output_d.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                later_rx_bps = float(parts[8])
+                later_tx_bps = float(parts[9])
+                later_bps_d[iface] = (later_rx_bps, later_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep D': {line}")
+                
+
+        logger.info("Starting PRE-CHECK traffic validation...")
+
+        # --- First Measurement ---
+        logger.info("Capturing first measurement of traffic counters for pre-check...")
+        output_1 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+        # Parse 1st measurement (inline logic)
+        pre_counters_1 = {}
+        # Regex pattern to capture interface name, RX_OK, and TX_OK
+        pattern = re.compile(
+            r'^(?P<iface>\S+)\s+'         # Interface name
+            r'\S+\s+'                     # STATE
+            r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+            r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+            r'(?:[\d.,]+%)\s+'            # RX_UTIL
+            r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+            r'(?P<tx_ok>[\d,]+)'          # TX_OK
+        )
+
+        for line in output_1.splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                iface = match.group('iface')
+                rx_ok = int(match.group('rx_ok').replace(',', ''))
+                tx_ok = int(match.group('tx_ok').replace(',', ''))
+                pre_counters_1[iface] = {
+                    'RX_OK': rx_ok,
+                    'TX_OK': tx_ok
+                }
+
+        logger.info(f"Pre-Check Counters (First Measurement): {pre_counters_1}")
+
+        # --- Wait ---
+        logger.info("waiting for 600 seconds")
+        time.sleep(600)
+
+        # --- Second Measurement ---
+        logger.info("Capturing second measurement of traffic counters for pre-check...")
+        output_2 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+        # Parse 1st measurement (inline logic)
+        pre_counters_2 = {}
+        # Regex pattern to capture interface name, RX_OK, and TX_OK
+        pattern = re.compile(
+            r'^(?P<iface>\S+)\s+'         # Interface name
+            r'\S+\s+'                     # STATE
+            r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+            r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+            r'(?:[\d.,]+%)\s+'            # RX_UTIL
+            r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+            r'(?P<tx_ok>[\d,]+)'          # TX_OK
+        )
+
+        for line in output_2.splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                iface = match.group('iface')
+                rx_ok = int(match.group('rx_ok').replace(',', ''))
+                tx_ok = int(match.group('tx_ok').replace(',', ''))
+                pre_counters_2[iface] = {
+                    'RX_OK': rx_ok,
+                    'TX_OK': tx_ok
+                }
+
+        logger.info(f"Pre-Check Counters (Second Measurement): {pre_counters_2}")
+
+        # --- Validation ---
+        logger.info("Validating traffic counters during pre-check...")
+
+        success_count = 0
+        interface_list_uut1 = ["Ethernet8", "Ethernet16", "Ethernet72", "Ethernet184", "Ethernet240", "Ethernet248"]
+
+        for iface in interface_list_uut1:
+            rx1 = pre_counters_1.get(iface, {}).get("RX_OK", 0)
+            rx2 = pre_counters_2.get(iface, {}).get("RX_OK", 0)
+            tx1 = pre_counters_1.get(iface, {}).get("TX_OK", 0)
+            tx2 = pre_counters_2.get(iface, {}).get("TX_OK", 0)
+
+            rx_diff = rx2 - rx1
+            tx_diff = tx2 - tx1
+
+            if rx_diff > 0 or tx_diff > 0:
+                logger.info(f"[SUCCESS] Traffic is running successfully on {iface}: RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+                success_count += 1
+            else:
+                logger.error(f"[FAILURE] No traffic activity on {iface} | RX_OK difference: {rx_diff}, TX_OK difference: {tx_diff}")
+
+        # --- Summary ---
+        total_interfaces = len(interface_list_uut1)
+        success_rate = (success_count / total_interfaces) * 100
+        logger.info(f"Traffic validation success on all interfaces: {success_rate:.2f}%")
+
+        if success_rate < 90.0:
+            self.failed(f"Traffic validation failed during pre-check. Only {success_rate:.2f}% interfaces passed")
+        else:
+            logger.info("Traffic validation passed based on threshold (>=90%)")
+
+
+        # Save counters before reboot
+        logger.info("Collecting interface counters BEFORE adding longetivity")
+        pre_counters = uut1.execute("show interface counters")
+        logger.info(f"Interface Counters (PRE):\n{pre_counters}")
+
+        # Clear counters
+        logger.info("Clearing interface counters")
+        uut1.execute("sonic-clear counters")
+
+        # Wait for counters to reset
+        time.sleep(30)
+
+        # Verify counters cleared
+        cleared_counters = uut1.execute("show interface counters")
+        logger.info(f"Interface Counters after clearing:\n{cleared_counters}")
+
+        count_cmd = uut1.execute("show interface counters errors")
+        # Ensure count_cmd is not empty or None
+        if not count_cmd:
+            logger.error("No output returned from 'show interface counters errors' command")
+            self.failed("No output from command")
+        else:
+            # Split the output into individual lines
+            pre_lines = count_cmd.splitlines()
+
+            # Continue processing the lines as required
+            pre_rx_err_found = False
+            pre_tx_err_found = False
+
+
+            # Skip header lines if necessary, adjust indexing if needed
+            data_lines = pre_lines[14:]
+
+            for line in data_lines:
+                line = line.strip()
+                if not line:
+                    continue  # Skip empty lines
+
+                columns = line.split()
+                if len(columns) >= 15:
+                    rx_err = int(columns[6])   # RX_ERR
+                    tx_err = int(columns[12])  # TX_ERR
+
+                    logger.info(f"[PRE] RX_ERR={rx_err}, TX_ERR={tx_err}")
+
+                    if rx_err == 0:
+                        pre_rx_err_found = True
+                    if tx_err == 0:
+                        pre_tx_err_found = True
+                else:
+                    logger.debug(f"[PRE] Skipping malformed line: {line}")
+
+            # Final check
+            if not (pre_rx_err_found or pre_tx_err_found):
+                logger.info("Counters are 0 for RX_ERR and TX_ERR before adding longetivity (as expected)")
+            else:
+                logger.error("Non-zero RX_ERR or TX_ERR found before adding longetivity")
+                self.failed("RX_ERR or TX_ERR not cleared before adding longetivity") 
+
+        # PRE-CHECK TIMESTAMP
+        pre_timestamp = uut1.execute('date')
+        logger.info(f"Raw date output before checking longevity: {pre_timestamp}")
+
+        # Match format like: Fri May 30 15:38:05 UTC 2025
+        match = re.search(r'\w+\s+(\w+)\s+(\d{1,2})\s+(\d{2}):(\d{2}):\d{2}\s+\w+\s+\d{4}', pre_timestamp)
+        if match:
+            pre_log_time = f"{match.group(1)} {match.group(2)} {match.group(3)}:{match.group(4)}"
+            syslog_date_prefix = f"{match.group(1)} {match.group(2)} {match.group(3)}:{match.group(4)}"
+            logger.info(f"Using syslog date prefix for flap detection: {syslog_date_prefix}")
+        else:
+            logger.error("Unable to parse pre_timestamp")
+            self.failed("Unable to parse pre_timestamp")
+
+        # Record the start time just before checking logs
+        start_time = time.time()
+
+        syslog_date_prefix = time.strftime("%b %e %H:%M:%S", time.gmtime(start_time))
+        logger.info(f"Using syslog date prefix: {syslog_date_prefix}")
+
+        timestamp = syslog_date_prefix
+        syslog_cmd = (
+            f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep -c 'oper state set'"
+        )    
+
+        
+        # for Saving the above config
+        uut1.execute("sudo config save -y")
+        time.sleep(5)
+
+        # Sleep for 30 minutes
+        logger.info("Sleeping for 2 Hour......")
+        time.sleep(1200)
+
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        logger.info("Performing POST-CHECKS...")
+
+        # Version Check
+        post_version_output = uut1.execute("show version")
+        post_version_match = re.search(r"SONiC Software Version:\s*(\S+)", post_version_output)
+        if not post_version_match:
+            self.failed("Failed to detect SONiC version in post-check")
+        post_version = post_version_match.group(1)
+        logger.info(f"Post-Check Version: {post_version}")
+
+        # SKU Detection
+        post_sku_output = uut1.execute("show platform summary")
+        post_sku_match = re.search(r"HwSKU:\s*(\S+)", post_sku_output)
+        if not post_sku_match:
+            self.failed("Failed to detect SKU in post-check")
+        post_sku = post_sku_match.group(1)
+        logger.info(f"Post-Check SKU: {post_sku}")
+
+        # Interface Status
+        post_interface_status = uut1.execute("show interface status")
+        post_up_count, post_down_count = 0, 0
+        for line in post_interface_status.splitlines():
+            if "Ethernet" in line:
+                fields = line.split()
+                if len(fields) >= 8 and fields[7].lower() == "up":
+                    post_up_count += 1
+                elif len(fields) >= 8 and fields[7].lower() == "down":
+                    post_down_count += 1
+        logger.info(f"Post-Check Interface Status: {post_up_count} UP, {post_down_count} DOWN")
+
+        # Traffic Check
+        # Step: Check BPS values are increasing for 'grep U' and 'grep D'
+        logger.info("Capturing initial BPS values for 'grep U' and 'grep D'")
+        post_initial_bps_output_u = uut1.execute("show interface counters | grep U")
+        post_initial_bps_output_d = uut1.execute("show interface counters | grep D")
+
+        time.sleep(60)
+        logger.info("Capturing BPS values after wait for 'grep U' and 'grep D'")
+        post_later_bps_output_u = uut1.execute("show interface counters | grep U")
+        post_later_bps_output_d = uut1.execute("show interface counters | grep D")
+
+        # Parse initial BPS for 'grep U'
+        initial_bps_u = {}
+        for line in post_initial_bps_output_u.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                post_rx_bps = float(parts[8])
+                post_tx_bps = float(parts[9])
+                initial_bps_u[iface] = (post_rx_bps, post_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+        # Parse initial BPS for 'grep D'
+        initial_bps_d = {}
+        for line in post_initial_bps_output_d.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                post_rx_bps = float(parts[8])
+                post_tx_bps = float(parts[9])
+                initial_bps_d[iface] = (post_rx_bps, post_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep D': {line}")
+
+        # Parse later BPS for 'grep U'
+        later_bps_u = {}
+        for line in post_later_bps_output_u.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                later_rx_bps = float(parts[8])
+                later_tx_bps = float(parts[9])
+                later_bps_u[iface] = (later_rx_bps, later_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+        # Parse later BPS for 'grep D'
+        later_bps_d = {}
+        for line in post_later_bps_output_d.splitlines():
+            parts = line.split()
+            if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+                iface = parts[0]
+                later_rx_bps = float(parts[8])
+                later_tx_bps = float(parts[9])
+                later_bps_d[iface] = (later_rx_bps, later_tx_bps)
+            else:
+                logger.debug(f"Skipping malformed line for 'grep D': {line}")
+
+
+        # # POST-CHECK: Traffic Validation
+        logger.info("Starting POST-CHECK traffic validation...")
+        # --- First Measurement ---
+        logger.info("Capturing first measurement of traffic counters for post-check...")
+        output_1 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+        # Parse 1st measurement (inline logic)
+        post_counters_1 = {}
+        # Regex pattern to capture interface name, RX_OK, and TX_OK
+        pattern = re.compile(
+            r'^(?P<iface>\S+)\s+'         # Interface name
+            r'\S+\s+'                     # STATE
+            r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+            r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+            r'(?:[\d.,]+%)\s+'            # RX_UTIL
+            r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+            r'(?P<tx_ok>[\d,]+)'          # TX_OK
+        )
+
+        for line in output_1.splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                iface = match.group('iface')
+                rx_ok = int(match.group('rx_ok').replace(',', ''))
+                tx_ok = int(match.group('tx_ok').replace(',', ''))
+                post_counters_1[iface] = {
+                    'RX_OK': rx_ok,
+                    'TX_OK': tx_ok
+                }
+
+        logger.info(f"Post-Check Counters (First Measurement): {post_counters_1}")
+
+        # --- Wait ---
+        logger.info("waiting for 600 seconds")
+        time.sleep(600)
+
+        # --- Second Measurement ---
+        logger.info("Capturing second measurement of traffic counters for post-check...")
+        output_2 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+        # Parse 1st measurement (inline logic)
+        post_counters_2 = {}
+        # Regex pattern to capture interface name, RX_OK, and TX_OK
+        pattern = re.compile(
+            r'^(?P<iface>\S+)\s+'         # Interface name
+            r'\S+\s+'                     # STATE
+            r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+            r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+            r'(?:[\d.,]+%)\s+'            # RX_UTIL
+            r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+            r'(?P<tx_ok>[\d,]+)'          # TX_OK
+        )
+
+        for line in output_2.splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                iface = match.group('iface')
+                rx_ok = int(match.group('rx_ok').replace(',', ''))
+                tx_ok = int(match.group('tx_ok').replace(',', ''))
+                post_counters_2[iface] = {
+                    'RX_OK': rx_ok,
+                    'TX_OK': tx_ok
+                }
+
+        logger.info(f"Post-Check Counters (Second Measurement): {post_counters_2}")
+
+        # --- Validation ---
+        logger.info("Validating traffic counters during post-check...")
+
+        success_count = 0
+        interface_list_uut1 = ["Ethernet8", "Ethernet16", "Ethernet72", "Ethernet184", "Ethernet240", "Ethernet248"]
+
+        for iface in interface_list_uut1:
+            rx1 = post_counters_1.get(iface, {}).get("RX_OK", 0)
+            rx2 = post_counters_2.get(iface, {}).get("RX_OK", 0)
+            tx1 = post_counters_1.get(iface, {}).get("TX_OK", 0)
+            tx2 = post_counters_2.get(iface, {}).get("TX_OK", 0)
+
+            rx_diff = rx2 - rx1
+            tx_diff = tx2 - tx1
+
+            if rx_diff >0 or tx_diff > 0:
+                logger.info(f"[SUCCESS] Traffic is running successfully on {iface}: RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+                success_count += 1
+            else:
+                logger.error(f"[FAILURE] No traffic activity on {iface} | RX_OK difference: {rx_diff}, TX_OK difference: {tx_diff}")
+
+        # --- Summary ---
+        total_interfaces = len(interface_list_uut1)
+        success_rate = (success_count / total_interfaces) * 100
+        logger.info(f"Traffic validation success on all interfaces: {success_rate:.2f}%")
+
+        if success_rate < 90.0:
+            self.failed(f"Traffic validation failed during post-check. Only {success_rate:.2f}% interfaces passed.")
+        else:
+            logger.info("Traffic validation passed based on threshold (>=90%)")
+                
+
+        # Interface Errors
+        post_error_counters = uut1.execute("show interface counters errors")
+        post_errors = {}
+        for line in post_error_counters.splitlines():
+            fields = line.split()
+            if len(fields) >= 15:
+                iface = fields[0]
+                rx_err = int(fields[6])
+                tx_err = int(fields[12])
+                post_errors[iface] = (rx_err, tx_err)
+        logger.info(f"Post-Check Errors (RX/TX): {post_errors}")
+
+        # Sleep to simulate wait before checking logs
+        time.sleep(5)  
+
+        # Record the start time just before checking logs
+        start_time = time.time()
+
+
+        # Build the syslog command using your original format
+        syslog_cmd = (
+            f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep -c 'oper state set'"
+        )
+        logger.info(f"Running flap count command: {syslog_cmd}")
+
+        # Execute the command on the device
+        count_flaps = uut1.execute(syslog_cmd).strip()
+        logger.info(f"Filtered link flap count: {count_flaps}")
+
+        # Check flap count and handle accordingly
+        if int(count_flaps) > 0:
+            logger.info("Link flaps detected after longetvity check")
+
+            # Collect the actual flap logs
+            flap_log_cmd = (
+                f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep 'oper state set'"
+            )
+            logger.info(f"Collecting link flap logs with: {flap_log_cmd}")
+            flap_logs = uut1.execute(flap_log_cmd)
+
+            # Simulate test failure
+            self.failed(
+                f"Link flap detected after longetvity check. Flap count: {count_flaps}. Logs:\n{flap_logs}"
+            )
+        else:
+            logger.info("No link flaps detected after longetvity check")
+
+
+        # Compare pre-check and post-check data
+        logger.info("Comparing PRE-CHECK and POST-CHECK results...")
+
+        # 1. Compare Software Version
+        if pre_version == post_version:
+            logger.info("Version matched between pre-check and post-check status")
+        else:
+            logger.error("Version mismatch detected")
+            self.failed("Version mismatch between pre-check and post-check status")
+
+        # 2. Compare SKU
+        if pre_sku == post_sku:
+            logger.info("SKU matched between pre-check and post-check status")
+        else:
+            logger.error("SKU mismatch detected")
+            self.failed("SKU mismatch between pre-check and post-check status")
+
+        # 3. Compare Interface Status
+        if pre_up_count == post_up_count and pre_down_count == post_down_count:
+            logger.info("Interface status matched between pre-check and post-check status")
+        else:
+            logger.error("Interface status mismatch detected")
+            self.failed("Interface status mismatch between pre-check and post-check status")
+
+        # 4. Compare Traffic Data (RX_OK and TX_OK)
+        logger.info("Validating traffic flow between pre-check and post-check...")
+        traffic_validation_successful = True
+
+        for iface in interface_list_uut1:
+            if iface in pre_counters_2 and iface in post_counters_1:
+                pre_rx = pre_counters_2[iface]["RX_OK"]
+                pre_tx = pre_counters_2[iface]["TX_OK"]
+                post_rx = post_counters_1[iface]["RX_OK"]
+                post_tx = post_counters_1[iface]["TX_OK"]
+
+                rx_diff = post_rx - pre_rx
+                tx_diff = post_tx - pre_tx
+
+                if rx_diff > 0 and tx_diff > 0:
+                    logger.info(f"[SUCCESS] Traffic is consistent for {iface} across pre-check and post-check: "
+                                f"RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+                else:
+                    logger.error(f"[FAILURE] Traffic validation failed for {iface}: "
+                                f"RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+                    traffic_validation_successful = False
+            else:
+                logger.warning(f"Interface {iface} not found in pre-check or post-check data. Skipping traffic validation")
+
+        if not traffic_validation_successful:
+            self.failed("Traffic validation failed between pre-check and post-check")
+
+        logger.info("All checks (version, SKU, interface status, traffic, and errors) completed successfully!")
+
+        # # 2. Exit device's root shell and return to normal admin shell
+        # logger.info("Exiting root shell on UUT1 and returning to admin shell")
+        # uut1.sendline("exit")
+        # # This should now correctly return to the admin prompt, and then the device will auto-logout.
+        # uut1.expect("admin@.*\\$")
+        # --- End of Corrected Exit Sequence ---
+        # uut2.sendline("exit")
+        # uut2.expect("admin@.*\\$")
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass   
+
+
+
+#################### Testcase 1 ######################################################
+
+# @aetest.skip
+@aetest.loop(iterationCount=range(1,2))
+class TC1_Link_Flap_stress_Test(aetest.Testcase):
+    @aetest.test
+    def verify_link_flap_stress_test(self, uut1, uut2, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6, uut2_int1, uut2_int2, uut2_int3, uut2_int4, uut2_int5, uut2_int6):
+
+        interface_list_uut1 = [uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6]
+        interface_list_uut2 = [uut2_int1, uut2_int2, uut2_int3, uut2_int4, uut2_int5, uut2_int6]
+
+
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        logger.info("Entering bash shell on UUT2")
+        uut2.sendline("sudo bash")
+        uut2.expect("root@.*#")
+        
+        #interface list to check in uut2
+        for intf_index, intf in enumerate(interface_list_uut1):
+            remote_intf = interface_list_uut2[intf_index]
+            
+            #starting up the interface in uut1
+            logger.info(f"Starting up interface {intf}")
+            uut1.sendline(f"config interface startup {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+            
+            #checking link status on uut1
+            logger.info(f"Checking link status of {intf} after startup")
+            output = uut1.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up after startup")
+
+            time.sleep(30)
+            
+            #Pre-LLDP
+            logger.info("Capturing pre-flap LLDP on UUT1")
+            pre_lldp_uut1 = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(f"Pre-flap LLDP data for {intf}:\n{pre_lldp_uut1}")
+            time.sleep(30)
+
+            #PRE-EEPROM
+            logger.info("Capturing pre-flap EEPROM on UUT1")
+            pre_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {intf}")
+            time.sleep(30)
+            
+            #remote interface check of Pre-LLDP uut2
+            pre_lldp_uut2 = uut2.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            logger.info(f"Pre-flap LLDP data for remote interface {remote_intf}:\n{pre_lldp_uut2}")
+            time.sleep(30)
+            
+            #remote check of Pre-EEPROm uut2
+            pre_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {remote_intf}")
+            
+            #shutting down the interface in uut1
+            logger.info(f"Shutting down {intf}")
+            uut1.sendline(f"config interface shutdown {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+            
+            #checking interface status in uut1
+            output = uut1.execute(f"show interface status {intf}")
+            logger.info(f"{intf} shutdown status: {output}")
+            
+            #lldp after the down the interfaces
+            lldp_after_down = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if not lldp_after_down.strip():
+                logger.info(f"No LLDP data found on {intf} after shutdown — expected")
+            else:
+                logger.warning(f"LLDP data still present after shutdown:\n{lldp_after_down}")
+            
+            #LLDP remote chcek after down the interface
+            logger.info(f"Validating LLDP loss on UUT2 for {remote_intf}")
+            lldp_remote_check = uut2.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            
+            #cross checking the LLDP in uut1
+            logger.info(f"Cross-checking LLDP and EEPROM on UUT1 for {intf}")
+            lldp_cross_check = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            eeprom_cross_check = uut1.execute(f"show interface transceiver eeprom {intf}")
+            
+            #again starting up the interface
+            logger.info(f"Starting up {intf} again on UUT1")
+            uut1.sendline(f"config interface startup {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+            
+            #checking interface status in uut1 again
+            output = uut1.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP post-startup")
+            else:
+                logger.warning(f"{intf} is NOT up post-startup")
+            time.sleep(30)
+            
+            #checking post lldp status in uut1
+            post_lldp_uut1 = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(f"LLDP Data Post-Flap for {intf}:\n{post_lldp_uut1}")
+            time.sleep(30)
+            
+            #checking post EEPROM status in uut1
+            post_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {intf}")
+            
+            #doing comparision in of Pre & post in uut1 (LLDP & EEPROM)
+            if normalize(pre_eeprom_uut1) == normalize(post_eeprom_uut1):
+                logger.info("EEPROM data matched between pre and post flap")
+            else:
+                logger.error("EEPROM MISMATCHED")
+                self.failed("EEPROM mismatch")
+
+            if normalize(pre_lldp_uut1) == normalize(post_lldp_uut1):
+                logger.info("LLDP data matched between pre and post flap")
+            else:
+                logger.error("LLDP MISMATCHED")
+                self.failed("LLDP mismatch")      
+
+    ##################UUT2############################################   
+
+        #interface list to check in uut2
+        for intf_index, intf in enumerate(interface_list_uut2):
+            remote_intf = interface_list_uut1[intf_index]
+                
+            #starting up the interface
+            logger.info(f"Starting up interface {intf}")
+            uut2.sendline(f"config interface startup {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+            
+            #link is up or not
+            logger.info(f"Checking link status of {intf} after startup")
+            output = uut2.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up after startup")
+
+            time.sleep(30)
+            
+            #pre lldp in uut2
+            logger.info("Capturing pre-flap LLDP on UUT2")
+            #pre lldp in uut2
+            pre_lldp_uut2 = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(f"Pre-flap LLDP data for {intf}:\n{pre_lldp_uut2}")
+            time.sleep(30)
+
+            #pre EEPROM in uut2
+            logger.info("Capturing pre-flap EEPROM on UUT2")
+            pre_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {intf}")
+            time.sleep(30)
+            
+            #pre lldp in uut1 for remote interface
+            pre_lldp_uut1 = uut1.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            logger.info(f"Pre-flap LLDP data for remote interface {remote_intf}:\n{pre_lldp_uut1}")
+            time.sleep(30)
+            
+            #pre eeprom in uut1
+            pre_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {remote_intf}")
+            
+            #shutting down the interfaces
+            logger.info(f"Shutting down {intf}")
+            uut2.sendline(f"config interface shutdown {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+            
+            #show interface status in uut2
+            output = uut2.execute(f"show interface status {intf}")
+            logger.info(f"{intf} shutdown status: {output}")
+            
+            #check lldp in uut2
+            lldp_after_down = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if not lldp_after_down.strip():
+                logger.info(f"No LLDP data found on {intf} after shutdown — expected")
+            else:
+                logger.warning(f"LLDP data still present after shutdown:\n{lldp_after_down}")
+            
+            #remote check of lldp
+            logger.info(f"Validating LLDP loss on UUT1 for {remote_intf}")
+            lldp_remote_check = uut1.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            
+            #cross check lldp
+            logger.info(f"Cross-checking LLDP and EEPROM on UUT2 for {intf}")
+            lldp_cross_check = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            eeprom_cross_check = uut2.execute(f"show interface transceiver eeprom {intf}")
+            
+            #again startup the interfaces
+            logger.info(f"Starting up {intf} again on UUT2")
+            uut2.sendline(f"config interface startup {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+            
+            #check interface status
+            output = uut2.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP post-startup")
+            else:
+                logger.warning(f"{intf} is NOT up post-startup")
+            time.sleep(30)
+            
+            #post lldp check in uut2
+            post_lldp_uut2 = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(f"LLDP Data Post-Flap for {intf}:\n{post_lldp_uut2}")
+            time.sleep(30)
+            
+            #post eeprom check in uut2
+            post_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {intf}")
+            
+            #comparision on lldp & eeprom in uut2
+            if normalize(pre_eeprom_uut2) == normalize(post_eeprom_uut2):
+                logger.info("EEPROM data matched between pre and post flap")
+            else:
+                logger.error("EEPROM MISMATCHED")
+                self.failed("EEPROM mismatch")
+
+            if normalize(pre_lldp_uut2) == normalize(post_lldp_uut2):
+                logger.info("LLDP data matched between pre and post flap")
+            else:
+                logger.error("LLDP MISMATCHED")
+                self.failed("LLDP mismatch")
+
+        logger.info("Sleeping for 300 seconds")
+        time.sleep (300)
+
+        # # Exit root shell and return to normal shell
+        # uut1.sendline("exit")
+        # uut1.expect("admin@.*\\$")
+
+        # uut2.sendline("exit")
+        # uut2.expect("admin@.*\\$")
+
+    # @aetest.cleanup
+    # def config_cleanup(self, uut1, uut2):
+    #     pass   
+
+
+
+########################### TESTCASE 2 ########################################################
+
+# @aetest.skip
+class TC2_Verify_SKU_Ports_Speeds(aetest.Testcase):
+    """
+    Testcase to verify SKU, port speeds, and link status
+    """
+
+    @aetest.test
+    def verify_ports_and_speeds(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6):
+
+        # interface_list_uut2 = [uut2_int1, uut2_int2, uut2_int3]
+        # Step 1: Enter bash on uut2
+        logger.info("Entering bash shell on UUT2")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        logger.info(f"Checking verification of SKU, port speeds, and link status on {uut1.name}")
+
+        #version checking
+        command_pre_version = f"show version"
+        uut1.execute("show version")
+
+        # Step 2: Detect SKU
+        platform_output = uut1.execute("show platform summary")
+        sku_match = re.search(r"HwSKU:\s*(\S+)", platform_output)
+        if not sku_match:
+            self.failed("HwSKU not found in platform summary")
+        sku = sku_match.group(1)
+        logger.info(f"Detected SKU: {sku}")
+
+        # Step 3: Extract expected port counts from SKU
+        expected_ports = {"25G": 0, "100G": 0, "200G": 0, "400G": 0}
+        if match := re.search(r'(\d+)x25G', sku):
+            expected_ports["25G"] = int(match.group(1))
+        if match := re.search(r'(\d+)x100G', sku):
+            expected_ports["100G"] = int(match.group(1))
+        if match := re.search(r'(\d+)x200G', sku):
+            expected_ports["200G"] = int(match.group(1))
+        if match := re.search(r'(\d+)x400G', sku):
+            expected_ports["400G"] = int(match.group(1))
+
+        logger.info(f"Expected ports from SKU: {expected_ports}")
+
+
+        # Step 4: Execute and parse 'show interface status'
+        logger.info("Executing 'show interface status'")
+        intf_output = uut1.execute("show interface status")
+
+        # Initialize counters
+        actual_status = {
+            "25G": {"found": 0, "up": 0},
+            "100G": {"found": 0, "up": 0},
+            "200G": {"found": 0, "up": 0},
+            "400G": {"found": 0, "up": 0}
+        }
+
+        for line in intf_output.splitlines():
+            if not line.strip() or 'Interface' in line:
+                continue
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+
+            speed = fields[2]
+            oper_status = fields[7].lower()
+
+            if "25G" in speed:
+                key = "25G"
+            elif "100G" in speed:
+                key = "100G"
+            elif "200G" in speed:
+                key = "200G"
+            elif "400G" in speed:
+                key = "400G"
+            else:
+                continue
+
+            actual_status[key]["found"] += 1
+            if oper_status == "up":
+                actual_status[key]["up"] += 1
+
+        # Step 5: Log expected vs actual port counts
+        logger.info("Port Summary Comparison")
+        for speed in ["25G", "100G", "200G", "400G"]:
+            logger.info(f"Ports as per SKU for {speed}: {expected_ports[speed]}")
+            logger.info(f"Total {speed} ports found: {actual_status[speed]['found']}")
+            logger.info(f"Total {speed} ports up: {actual_status[speed]['up']}")
+
+        # Step 6: Conditiontions to check port status
+        logger.info("Port Status Checks")
+        if expected_ports["25G"] > 0:
+            if actual_status["25G"]["found"] == 0:
+                logger.info("No 25G ports are found")
+
+        if expected_ports["100G"] > 0:
+            if actual_status["100G"]["up"] > 0:
+                logger.info("100G connections are currently up and functioning as expected")
+            else:
+                logger.info("Ports are not up in 100G")
+
+        if expected_ports["400G"] > 0:
+            if actual_status["400G"]["up"] > 0:
+                logger.info("400G connections are currently up and functioning as expected")
+            else:
+                logger.info("Ports are not up in 400G")
+                self.failed("Ports are not up between 25G, 100G, 400G as expected")         
+
+        # # Step 7: Exit bash
+        # uut1.sendline("exit")
+        # uut1.expect("admin@.*~\$")
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass   
+
+    
+###################################### TESTCASE 3 #####################################
+
+
+@aetest.skip
+class TC3_Verify_Firmware_SDK(aetest.Testcase):
+
+    @aetest.test
+    def verify_firmware_and_sdk(self, uut2):
+        """
+        Verifies VEGA firmware version on ports fp 1–6 and 27–32
+        """
+
+        logger.info(f"Checking firmware version on {uut2.name}")
+
+        # Step 1: Get expected version from YAML
+        custom_data = getattr(uut2, "custom", {}) or {}
+        expected_fw_version = custom_data.get("firmware", {}).get("vega_fw_version")
+
+        if expected_fw_version:
+            logger.info(f"Expected VEGA Firmware Version: {expected_fw_version}")
+        else:
+            logger.warning("Expected firmware version not found in YAML. Aborting check")
+            self.skipped("No expected firmware version to compare")
+            return
+
+        # Step 2: Enter bash shell
+        logger.info("Entering bash shell on device")
+        uut2.sendline("sudo bash")
+        uut2.expect("root@.*#")
+
+        # Step 3: Capture 'show version'
+        logger.info("Capturing 'show version' output")
+        version_output = uut2.execute("show version")
+        # logger.info(f"'show version' Output:\n{version_output}")
+
+        # Step 4: Define front panel ports to check
+        fp_ports = list(range(1, 7)) + list(range(27, 33))  # fp 1–6 and 27–32
+
+        logger.info(f"Checking firmware on front panel ports: {fp_ports}")
+
+        # Step 5: Check firmware version
+        version_match = True
+        failed_ports = []
+
+        for fp in fp_ports:
+            cmd = f"docker exec -it syncd /usr/bin/sonic_inphi_vega_sdk_app --cmd version --fp {fp}"
+            logger.info(f"Executing: {cmd}")
+
+            try:
+                output = uut2.execute(cmd)
+            except Exception as e:
+                logger.error(f"Command failed for fp {fp}: {e}")
+                failed_ports.append((fp, "CMD_FAIL"))
+                version_match = False
+                continue
+
+            logger.info(f"Output for front panel port {fp}:\n{output}")
+
+            fw_match = re.search(r"VEGA FW VERSION.*?(\d+\.\d+\.\d+)", output)
+            if fw_match:
+                actual_fw = fw_match.group(1)
+                logger.info(f"VEGA Firmware Version for front panel port {fp}: {actual_fw}")
+
+                if actual_fw == expected_fw_version:
+                    logger.info(f"Front panel port {fp} Firmware version is {actual_fw} and matched expected version")
+                else:
+                    logger.error(f"Firmware mismatch on front panel port {fp}: Expected {expected_fw_version}, Found {actual_fw}")
+                    failed_ports.append((fp, actual_fw))
+                    version_match = False
+            else:
+                logger.error(f"Could not extract firmware version for front panel port {fp}")
+                failed_ports.append((fp, "PARSE_FAIL"))
+                version_match = False
+
+        # Step 6: Final result
+        if version_match:
+            logger.info("Tetscase Passed: All firmware versions matched to Expected Version")
+        else:
+            for fp, issue in failed_ports:
+                logger.error(f"Mismatch or error on front panel port {fp}: {issue}")
+            self.failed(f"{len(failed_ports)} ports failed firmware version check")
+
+        # # Step 7: Exit bash shell
+        # uut2.sendline("exit")
+        # uut2.expect("admin@.*~\$")
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass   
+
+
+#################################### TESTCASE 4 ########################################################
+
+
+@aetest.skip
+class TC4_Verify_Retimer_To_NonRetimer_Interface_Speeds(aetest.Testcase):
+
+    @aetest.test
+    def verify_link_flaps_by_port_type(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6, uut2, uut2_int1, uut2_int2, uut2_int3, uut2_int4, uut2_int5, uut2_int6):
+        
+        logger.info("Entering bash shell")
+        uut1.sendline("sudo bash")
+        uut1.expect(r"root@.*#")
+
+        INTERFACE_TYPES = {
+            "uut1_int1": "non-retimer",
+            "uut1_int3": "non-retimer",
+            "uut1_int2": "retimer",
+            "uut2_int4": "non-retimer",
+            "uut2_int1": "retimer",
+            "uut2_int2": "retimer",
+        }
+
+        # List of interface variable pairs 
+        INTERFACE_PAIRS = [
+            ("uut1_int1", "uut2_int4"),
+            ("uut1_int3", "uut2_int1"),
+            ("uut1_int2", "uut2_int2"),
+        ]
+
+        # Classify test pairs based on type
+        test_groups = {
+            "retimer-retimer": [],
+            "retimer-nonretimer": [],
+            "nonretimer-nonretimer": []
+        }
+
+        for intf1, intf2 in INTERFACE_PAIRS:
+            type1 = INTERFACE_TYPES[intf1]
+            type2 = INTERFACE_TYPES[intf2]
+
+            if type1 == "retimer" and type2 == "retimer":
+                test_groups["retimer-retimer"].append((intf1, intf2))
+            elif "retimer" in (type1, type2):
+                test_groups["retimer-nonretimer"].append((intf1, intf2))
+            else:
+                test_groups["nonretimer-nonretimer"].append((intf1, intf2))
+
+        # Map logical names to actual interfaces passed from testbed
+        interface_mapping_uut1 = {
+            "uut1_int1": uut1_int1,
+            "uut1_int3": uut1_int3,
+            "uut1_int2": uut1_int2,
+        }
+
+        interface_mapping_uut2 = {
+            "uut2_int4": uut2_int4,
+            "uut2_int1": uut2_int1,
+            "uut2_int2": uut2_int2,
+        }
+
+        flap_count = defaultdict(int)
+
+        # ----- Testing on UUT1 -----
+        logger.info("===== Testing on UUT1 =====")
+        for group_name, pairs in test_groups.items():
+            logger.info(f"===== Testing {group_name} links on UUT1 =====")
+            for intf1, _ in pairs:
+                real_intf = interface_mapping_uut1[intf1]
+                logger.info(f"Testing interface {real_intf} on UUT1")
+
+                pre_lldp = uut1.execute(f"show lldp neighbors {real_intf} | grep -v Time")
+                time.sleep(30)
+
+                pre_eeprom = uut1.execute(f"show interface transceiver eeprom {real_intf}")
+
+                for i in range(2):
+                    logger.info(f"Flap Iteration {i+1}/2 on {real_intf} (UUT1)")
+
+                    uut1.sendline(f"config interface shutdown {real_intf}")
+                    uut1.expect("#")
+                    time.sleep(30)
+
+                    uut1.sendline(f"config interface startup {real_intf}")
+                    uut1.expect("#")
+                    time.sleep(30)
+
+                    output = uut1.execute(f"show interface status {real_intf}")
+                    if "up" not in output.lower():
+                        logger.warning(f"{real_intf} did not come up:\n{output}")
+                    else:
+                        logger.info(f"{real_intf} is up after flap")
+
+                    flap_count[real_intf] += 1
+                    time.sleep(30)    
+
+                post_lldp = uut1.execute(f"show lldp neighbors {real_intf} | grep -v Time")
+                time.sleep(30)
+
+                lldp_status_match = pre_lldp.strip() == post_lldp.strip()
+                if lldp_status_match:
+                    logger.info(f"LLDP matched for {real_intf} on UUT1")
+                else:
+                    logger.warning(f"LLDP mismatch for {real_intf} on UUT1:\nPre:\n{pre_lldp}\nPost:\n{post_lldp}")
+                time.sleep(30)
+
+                post_eeprom = uut1.execute(f"show interface transceiver eeprom {real_intf}")
+                eeprom_match = pre_eeprom.strip() == post_eeprom.strip()
+
+                if eeprom_match:
+                    logger.info(f"EEPROM matched for {real_intf} on UUT1")
+                else:
+                    logger.warning(f"EEPROM mismatch for {real_intf} on UUT1:\nPre:\n{pre_eeprom}\nPost:\n{post_eeprom}")
+
+                logger.info(f"Flap Results on UUT1 for {real_intf}:")
+                logger.info(f"Flap Count: {flap_count[real_intf]}")
+                logger.info(f"LLDP Status Pre-Flap: {pre_lldp}")
+                logger.info(f"LLDP Status Post-Flap: {post_lldp}")
+                logger.info(f"EEPROM Match: {'Yes' if eeprom_match else 'No'}")
+
+                if eeprom_match and lldp_status_match:
+                    logger.info(f"Test passed for {real_intf} on UUT1")
+                else:
+                    self.failed(f"Test failed for {real_intf} on UUT1")
+
+        # # Exit UUT1 bash
+        # uut1.sendline("exit")
+        # uut1.expect("admin@.*~\$")
+
+        # ----- Testing on UUT2 -----
+        logger.info("Performing LLDP and EEPROM checks on UUT2")
+        uut2.sendline("sudo bash")
+        uut2.expect("root@.*#")
+
+        logger.info("===== Testing on UUT2 =====")
+        for group_name, pairs in test_groups.items():
+            logger.info(f"===== Testing {group_name} links on UUT2 =====")
+            for _, intf2 in pairs:
+                real_intf = interface_mapping_uut2[intf2]
+                logger.info(f"Testing interface {real_intf} on UUT2")
+
+                pre_lldp = uut2.execute(f"show lldp neighbors {real_intf} | grep -v Time")
+                time.sleep(30)
+
+                pre_eeprom = uut2.execute(f"show interface transceiver eeprom {real_intf}")
+
+                for i in range(2):
+                    logger.info(f"Flap Iteration {i+1}/2 on {real_intf} (UUT2)")
+
+                    uut2.sendline(f"config interface shutdown {real_intf}")
+                    uut2.expect("#")
+                    time.sleep(30)
+
+                    uut2.sendline(f"config interface startup {real_intf}")
+                    uut2.expect("#")
+                    time.sleep(30)
+
+                    output = uut2.execute(f"show interface status {real_intf}")
+                    if "up" not in output.lower():
+                        logger.warning(f"{real_intf} did not come up:\n{output}")
+                    else:
+                        logger.info(f"{real_intf} is up after flap")
+
+                    flap_count[real_intf] += 1
+
+                    time.sleep(30)
+
+                post_lldp = uut2.execute(f"show lldp neighbors {real_intf} | grep -v Time")
+                time.sleep(30)
+
+                lldp_status_match = pre_lldp.strip() == post_lldp.strip()
+
+                if lldp_status_match:
+                    logger.info(f"LLDP matched for {real_intf} on UUT2")
+                else:
+                    logger.warning(f"LLDP mismatch for {real_intf} on UUT2:\nPre:\n{pre_lldp}\nPost:\n{post_lldp}")
+                time.sleep(30)
+
+                post_eeprom = uut2.execute(f"show interface transceiver eeprom {real_intf}")
+                eeprom_match = pre_eeprom.strip() == post_eeprom.strip()
+
+                if eeprom_match:
+                    logger.info(f"EEPROM matched for {real_intf} on UUT2")
+                else:
+                    logger.warning(f"EEPROM mismatch for {real_intf} on UUT2:\nPre:\n{pre_eeprom}\nPost:\n{post_eeprom}")
+
+                logger.info(f"Flap Results on UUT2 for {real_intf}:")
+                logger.info(f"Flap Count: {flap_count[real_intf]}")
+                logger.info(f"LLDP Status Pre-Flap: {pre_lldp}")
+                logger.info(f"LLDP Status Post-Flap: {post_lldp}")
+                logger.info(f"EEPROM Match: {'Yes' if eeprom_match else 'No'}")
+
+                if eeprom_match and lldp_status_match:
+                    logger.info(f"Test passed for {real_intf} on UUT2")
+                else:
+                    self.failed(f"Test failed for {real_intf} on UUT2")
+
+        # Final summary
+        logger.info("===== Final Flap Summary =====")
+        for intf, count in flap_count.items():
+            logger.info(f"{intf} was flapped {count} times")
+
+        # uut2.sendline("exit")
+        # uut2.expect("admin@.*~\$")       
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass   
+
+
+
+######################################## TESTCASE 5 #################################################################
+
+# @aetest.skip
+#TESTCASE:10
+class TC5_Multiple_Link_Flap_Verification(aetest.Testcase):
+
+    @aetest.test
+    def flap_ports_and_verify(self, uut1, uut1_int1):
+        logger.info("Starting link flap and verification test")
+
+        # Enter privileged bash shell
+        logger.info("Entering bash shell")
+        uut1.sendline("sudo bash")
+        uut1.expect(r"root@.*#")
+
+        # PRE-CHECK EEPROM and LLDP
+        logger.info("Collecting LLDP and EEPROM info before link flap")
+
+        # LLDP pre-check on UUT1
+        logger.info("Capturing LLDP neighbors before flapping")
+        pre_lldp = uut1.execute(f"show lldp neighbors {uut1_int1} | grep -v Time")
+        if pre_lldp.strip():
+            logger.info(f"LLDP Data Pre-Flap:\n{pre_lldp}")
+        else:
+            logger.warning(f"LLDP data not found on {uut1_int1} before flap")
+        time.sleep(30)    
+        
+        # EEPROM Verification (Pre-Flap)
+        logger.info("Verifying EEPROM data pre-flaps")
+        pre_eeprom = uut1.execute(f"show interface transceiver eeprom {uut1_int1}")
+        if any(field in pre_eeprom for field in ["Serial Number", "Vendor", "Part Number"]):
+            logger.info(f"EEPROM data found for {uut1_int1}:\n" + pre_eeprom)
+        else:
+            logger.warning(f"EEPROM output did not contain expected fields for {uut1_int1}:\n" + pre_eeprom)
+            
+
+        # Interface List and Iterations
+        interface_list = [uut1_int1]
+        iterations = 1
+
+
+        for i in range(iterations):
+            logger.info(f"Flap Iteration {i+1}/{iterations}")
+            for intf in interface_list:
+                # Shutdown
+                logger.info(f"Shutting down {intf}")
+                uut1.sendline(f"config interface shutdown {intf}")
+                uut1.expect("#")
+                time.sleep(30)
+
+                # Down Status
+                logger.info(f"Verifying {intf} is down")
+                output = uut1.execute(f"show interface status {intf}")
+                if "down" not in output.lower():
+                    logger.warning(f"{intf} did not go down as expected:\n{output}")
+                else:
+                    logger.info(f"{intf} is confirmed down ")
+
+                # Startup
+                logger.info(f"Starting up {intf}")
+                uut1.sendline(f"config interface startup {intf}")
+                uut1.expect("#")
+                time.sleep(30)
+
+                # Up Status
+                logger.info(f"Verifying {intf} is up")
+                output = uut1.execute(f"show interface status {intf}")
+
+                match = re.search(rf"{intf}\s+.*\s+(up|down)\s+(up|down)", output)
+                if match:
+                    oper_status, admin_status = match.group(1), match.group(2)
+                    logger.info(f"{intf} status - Oper: {oper_status}, Admin: {admin_status}")
+                    if oper_status == "up":
+                        logger.warning(f"{intf} oper status is not up:\n{output}")
+                    else:
+                        logger.info(f"{intf} is confirmed operationally up")
+                else:
+                    logger.warning(f"Could not parse status for {intf}:\n{output}")
+
+        # POST-CHECK EEPROM and LLDP
+        logger.info("Collecting LLDP and EEPROM info after link flap")
+
+        time.sleep(30)
+
+        # LLDP Verification (Post-Flap)
+        logger.info("Capturing LLDP neighbors post flapping")
+        post_lldp = uut1.execute(f"show lldp neighbors {uut1_int1} | grep -v Time")
+        if post_lldp.strip():
+            logger.info(f"LLDP Data Post-Flap:\n{post_lldp}")
+        else:
+            logger.warning(f"No LLDP data found on {uut1_int1} before flap")
+        time.sleep(30)        
+
+        # EEPROM Verification (Post-Flap)
+        logger.info("Verifying EEPROM data post-flaps")
+        post_eeprom = uut1.execute(f"show interface transceiver eeprom {uut1_int1}")
+        if any(field in post_eeprom for field in ["Serial Number", "Vendor", "Part Number"]):
+            logger.info(f"EEPROM data found for {uut1_int1}:\n" + post_eeprom)
+        else:
+            logger.warning(f"EEPROM output did not contain expected fields for {uut1_int1}:\n" + post_eeprom)
+        time.sleep(30)    
+
+        
+        # Compare EEPROM data
+        normalized_pre_eeprom = normalize(pre_eeprom)
+        normalized_post_eeprom = normalize(post_eeprom)
+
+        if normalized_pre_eeprom == normalized_post_eeprom:
+            logger.info(f"EEPROM data matched between: \nPre:\n{normalized_pre_eeprom}\nPost:\n{normalized_post_eeprom}")
+            # self.passed("EEPROM output matched in pre & post check")
+        else:
+            logger.error(f"EEPROM data mismatch: \nPre:\n{normalized_pre_eeprom}\nPost:\n{normalized_post_eeprom}")
+    
+            self.failed("EEPROM output not matched after pre & post check")
+
+        time.sleep(30)    
+
+        # Compare LLDP data
+        normalized_pre_lldp = normalize(pre_lldp)
+        normalized_post_lldp = normalize(post_lldp)
+        if normalized_pre_lldp == normalized_post_lldp:
+            logger.info(f"LLDP data matched between: \nPre:\n{normalized_pre_lldp}\nPost:\n{normalized_post_lldp}")
+            # self.passed("LLDP output matched in pre & post check")
+        else:
+            logger.warning(f"LLDP data mismatch: \nPre:\n{normalized_pre_lldp}\nPost:\n{normalized_post_lldp}")
+            # self.failed("LLDP output not matched in pre & post check")
+
+        # # Exit Shell
+        # logger.info("Exiting bash shell")
+        # uut1.sendline("exit")
+        # uut1.expect("admin@.*~\$")    
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass   
+
+######################################### TESTCASE 6 ###########################################################
+
+
+# @aetest.skip
+#TESTCASE:9
+class TC6_LLDP_Check_Local_Remote(aetest.Testcase):
+
+    @aetest.test
+    def LLDP_and_EEPROM_Validation(self, uut1, uut2, uut1_int1, uut2_int1):
+        interface_list = [uut1_int1]
+
+        # Enter bash on uut1
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        for intf in interface_list:
+            logger.info(f"==== Starting interface testing for {intf} on UUT1 ====")
+
+            # Startup interface
+            logger.info(f"Starting up interface {intf}")
+            uut1.sendline(f"config interface startup {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+
+            logger.info(f"Checking link status of {intf} after startup")
+            output = uut1.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up after startup")
+
+            time.sleep(30)    
+
+            # LLDP pre-check on UUT1
+            logger.info("Capturing LLDP neighbors before flapping")
+            pre_lldp_uut1 = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if pre_lldp_uut1.strip():
+                logger.info(f"LLDP Data Pre-Flap:\n{pre_lldp_uut1}")
+            else:
+                logger.warning(f"No LLDP data found on {intf} before flap")
+
+            time.sleep(30)
+
+            # EEPROM pre-check
+            logger.info("Capturing EEPROM data before flap")
+            pre_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {intf}")
+            if any(field in pre_eeprom_uut1 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM Data Pre-Flap:\n{pre_eeprom_uut1}")
+            else:
+                logger.warning(f"EEPROM fields missing pre-flap on {intf}:\n{pre_eeprom_uut1}")
+            
+            time.sleep(30)
+
+            # PRE-CHECK LLDP
+            logger.info("Capturing pre-flap LLDP on UUT2")
+            pre_lldp_uut2 = uut2.execute(f"show lldp neighbors {uut2_int1} | grep -v Time")
+            if pre_lldp_uut2.strip():
+                logger.info(f"Pre-flap LLDP data for {uut2_int1}:\n{pre_lldp_uut2}")
+            else:
+                logger.warning(f"LLDP output missing expected fields for {uut2_int1}:\n{pre_lldp_uut2}")
+
+            time.sleep(30)
+
+            # PRE-CHECK EEPROM
+            logger.info("Capturing pre-flap EEPROM on UUT2")
+            pre_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {uut2_int1}")
+            if any(field in pre_eeprom_uut2 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM read successfully for {uut2_int1}:\n{pre_eeprom_uut2}")
+            else:
+                logger.warning(f"EEPROM output missing expected fields for {uut2_int1}:\n{pre_eeprom_uut2}")    
+
+            # Shutdown
+            logger.info(f"Shutting down {intf}")
+            uut1.sendline(f"config interface shutdown {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+
+            logger.info(f"Checking link status of {intf} after shutdown")
+            output = uut1.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN after shutdown")
+            else:
+                logger.warning(f"{intf} is NOT down after shutdown")  
+                 
+
+            # LLDP check after shutdown
+            lldp_after_down = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if not lldp_after_down.strip():
+                logger.info(f"No LLDP data found on {intf} after shutdown in uut1")
+            else:
+                logger.warning(f"LLDP data still present after shutdown:\n{lldp_after_down}")
+            time.sleep(10)      
+
+
+            #Define remote_intf before using it
+            remote_intf = uut2_int1
+
+            # Validate LLDP loss on UUT1 after UUT2 interface shutdown
+            remote_intf = uut2_int1
+            logger.info(f"Validating LLDP loss on UUT2 for remote interface {remote_intf} after shutting down the corresponding interface on UUT2")
+            lldp_remote_check = uut2.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            if not lldp_remote_check.strip():
+                logger.info(f"LLDP entry correctly gone on UUT2 {remote_intf}")
+            else:
+                logger.error(f"LLDP still present on UUT2 {remote_intf}:\n{lldp_remote_check}")
+                self.failed("LLDP not cleared on UUT1 after UUT2 shutdown")  
+            time.sleep(10)   
+
+
+            # Cross-check LLDP and EEPROM on UUT2 while UUT1 interface is down
+            logger.info(f"Verifying LLDP and EEPROM data on UUT1 for interface {intf} while the corresponding interface on UUT1 is down")
+            lldp_cross_check = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            eeprom_cross_check = uut1.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(f"Cross-check LLDP on UUT1:\n{lldp_cross_check}")
+            logger.info(f"Cross-check EEPROM on UUT1:\n{eeprom_cross_check}")
+
+            # Startup again
+            logger.info(f"Starting up {intf} again on UUT1")
+            uut1.sendline(f"config interface startup {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+
+            logger.info(f"Checking link status of {intf} post-startup")
+            output = uut1.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is successfully UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up post-startup")
+
+            time.sleep(30)
+
+            # LLDP post-check on UUT1
+            logger.info("Capturing LLDP neighbors before flapping")
+            post_lldp_uut1 = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if post_lldp_uut1.strip():
+                logger.info(f"LLDP Data Post-Flap:\n{post_lldp_uut1}")
+            else:
+                logger.warning(f"No LLDP data found on {intf} before flap")
+
+            time.sleep(30)
+
+            # EEPROM post-check
+            logger.info("Capturing EEPROM data before flap")
+            post_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {intf}")
+            if any(field in post_eeprom_uut1 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM Data Post-Flap:\n{post_eeprom_uut1}")
+            else:
+                logger.warning(f"EEPROM fields missing post-flap on {intf}:\n{post_eeprom_uut1}")
+
+            # Compare EEPROM
+            if normalize(pre_eeprom_uut1) == normalize(post_eeprom_uut1):
+                logger.info("EEPROM data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("EEPROM MISMATCHED")
+                self.failed("EEPROM mismatch")
+
+            # Compare LLDP
+            if normalize(pre_lldp_uut1) == normalize(post_lldp_uut1):
+                logger.info("LLDP data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("LLDP MISMATCHED")
+                self.failed("LLDP mismatch")
+
+        # # Exit UUT1 bash
+        # uut1.sendline("exit")
+        # uut1.expect("admin@.*~\$")
+
+
+        ######################################################################
+        # UUT2 Checks
+        ######################################################################
+
+
+        interface_list = [uut2_int1]
+
+        logger.info("Performing LLDP and EEPROM checks on UUT2")
+        uut2.sendline("sudo bash")
+        uut2.expect("root@.*#")
+
+        for intf in interface_list:
+            logger.info(f"==== Starting interface testing for {intf} on UUT2 ====")
+
+            logger.info(f"Starting up {intf}")
+            uut2.sendline(f"config interface startup {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+
+            logger.info("Link status after startup")
+            output = uut2.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up after startup")
+
+            time.sleep(30)   
+                
+
+            # LLDP pre-check on UUT1
+            logger.info("Capturing LLDP neighbors before flapping")
+            pre_lldp_uut2 = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if pre_lldp_uut2.strip():
+                logger.info(f"LLDP Data Pre-Flap:\n{pre_lldp_uut2}")
+            else:
+                logger.warning(f"No LLDP data found on {intf} before flap")
+
+            time.sleep(30)
+
+            # EEPROM pre-check
+            logger.info("Capturing EEPROM data before flap")
+            pre_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {intf}")
+            if any(field in pre_eeprom_uut2 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM Data Pre-Flap:\n{pre_eeprom_uut2}")
+            else:
+                logger.warning(f"EEPROM fields missing pre-flap on {intf}:\n{pre_eeprom_uut2}")
+            
+            time.sleep(30)
+
+            # PRE-CHECK LLDP
+            logger.info("Capturing pre-flap LLDP on UUT1")
+            pre_lldp_uut1 = uut1.execute(f"show lldp neighbors {uut1_int1} | grep -v Time")
+            if pre_lldp_uut1.strip():
+                logger.info(f"Pre-flap LLDP data for {uut1_int1}:\n{pre_lldp_uut1}")
+            else:
+                logger.warning(f"LLDP output missing expected fields for {uut1_int1}:\n{pre_lldp_uut1}")
+
+            time.sleep(30)
+
+            # PRE-CHECK EEPROM
+            logger.info("Capturing pre-flap EEPROM on UUT1")
+            pre_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {uut1_int1}")
+            if any(field in pre_eeprom_uut1 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM read successfully for {uut1_int1}:\n{pre_eeprom_uut1}")
+            else:
+                logger.warning(f"EEPROM output missing expected fields for {uut1_int1}:\n{pre_eeprom_uut1}")     
+
+            #shutting down the interface
+            logger.info("Shutting down interface")
+            uut2.sendline(f"config interface shutdown {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+
+            logger.info("Link status after shutdown")
+            output = uut2.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN after shutdown")
+            else:
+                logger.warning(f"{intf} is NOT down after shutdown")
+
+            # LLDP check after shutdown
+            lldp_after_down = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if not lldp_after_down.strip():
+                logger.info(f"No LLDP data found on {intf} after shutdown in uut2")
+            else:
+                logger.warning(f"LLDP data still present after shutdown:\n{lldp_after_down}")
+            time.sleep(10)    
+            
+             
+                
+            # Validate LLDP loss on UUT1 after UUT2 interface shutdown
+            remote_intf = uut1_int1
+            logger.info(f"Validating LLDP loss on UUT1 for remote interface {remote_intf} after shutting down the corresponding interface on UUT2")
+            lldp_remote_check = uut1.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            if not lldp_remote_check.strip():
+                logger.info(f"LLDP entry correctly gone on UUT1 {remote_intf}")
+            else:
+                logger.error(f"LLDP still present on UUT1 {remote_intf}:\n{lldp_remote_check}")
+                self.failed("LLDP not cleared on UUT1 after UUT2 shutdown")
+            time.sleep(10)    
+
+            # Cross-check LLDP and EEPROM on UUT2 while UUT1 interface is down
+            logger.info(f"Verifying LLDP and EEPROM data on UUT2 for interface {intf} while the corresponding interface on UUT1 is down")
+            lldp_cross_check = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            eeprom_cross_check = uut2.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(f"Cross-check LLDP on UUT2:\n{lldp_cross_check}")
+            logger.info(f"Cross-check EEPROM on UUT2:\n{eeprom_cross_check}")
+
+            # Restart interface
+            logger.info(f"Starting up {intf} again")
+            uut2.sendline(f"config interface startup {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+            
+            #Checking link status is up or not
+            logger.info(f"Checking link status of {intf} post-startup")
+            output = uut2.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is successfully UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up post-startup")
+
+            time.sleep(30)
+
+            #Again need to check the Pre & Post-Flap
+
+            #Post-LLDP of UUT2
+            logger.info("Capturing post-flap LLDP data on UUT1")
+            post_lldp_uut2 = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+
+            time.sleep(30)
+            #Post EEPROM of UUT2
+            logger.info("Capturing post-flap EEPROM data on UUT1")
+            post_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {intf}")
+            time.sleep(30)
+            
+
+            # Compare
+            if normalize(pre_eeprom_uut2) == normalize(post_eeprom_uut2):
+                logger.info("EEPROM data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("EEPROM MISMATCHED")
+                self.failed("EEPROM mismatch")
+
+            if normalize(pre_lldp_uut2) == normalize(post_lldp_uut2):
+                logger.info("LLDP data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("LLDP MISMATCHED")
+                self.failed("LLDP mismatch")
+
+        # uut2.sendline("exit")  
+        # uut2.expect("admin@.*~\$")
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass    
+
+
+################################################# TESTCASE 7 #####################################################
+
+
+@aetest.skip
+class TC7_SwitchReload_Verify_Status(aetest.Testcase):
+
+    @aetest.test
+    def pre_post_reboot_link_verification_check(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6):
+        interface_list_uut1 = [uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6]
+
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        ##### PRE-CHECKS #####
+        logger.info("PRE-CHECKS of UUT1")
+
+        # Pre-reboot version
+        pre_version = uut1.execute('show version')
+        logger.info("Pre-reboot version:\n" + pre_version)
+
+        pre_version_match = re.search(r'SONiC Software Version:\s*(\S+)', pre_version)
+        if not pre_version_match:
+            self.failed("SONiC version not found in pre-checks")
+        pre_sonic_version = pre_version_match.group(1)
+
+        #PRE-REBOOT of SKU CHECK
+        pre_platform_output = uut1.execute("show platform summary")
+        pre_sku_match = re.search(r"HwSKU:\s*(\S+)", pre_platform_output)
+        if not pre_sku_match:
+            self.failed("HwSKU not found in pre-checks")
+        pre_sku = pre_sku_match.group(1)
+        logger.info(f"Detected PRE SKU: {pre_sku}")
+
+        sku_map = {
+            "96x25g+8x100-8x200": {"25G": 96, "100G": 8, "200G": 8, "400G": 0},
+            "Nexus-C3432D-32d": {"25G": 0, "100G": 0, "200G": 0, "400G": 32},
+            "Nexus-C3432D-48x200G-32x100G": {"25G": 0, "100G": 32, "200G": 48, "400G": 0},
+            "Nexus-C3432D-48x100G-8x400G": {"25G": 0, "100G": 48, "200G": 0, "400G": 8},
+            "Nexus-C3432D-96x25G-16x200G": {"25G": 96, "100G": 0, "200G": 16, "400G": 0}
+        }
+
+        pre_expected_ports = {"25G": 0, "100G": 0, "200G": 0, "400G": 0}
+        for key in sku_map:
+            if key in pre_sku:
+                pre_expected_ports = sku_map[key]
+                break
+
+        # pre_expected_ports = get_expected_ports_from_sku(pre_sku)
+        pre_total_expected = sum(pre_expected_ports.values())
+        logger.info(f"Expected ports from SKU in Pre-Reboot: {pre_expected_ports}")
+
+        # Interface status
+        intf_output = uut1.execute("show interface status")
+        actual_status = {k: {"found": 0, "up": 0} for k in pre_expected_ports}
+        for line in intf_output.splitlines():
+            if not line.strip() or 'Interface' in line:
+                continue
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            speed, oper_status = fields[2], fields[7].lower()
+            for key in actual_status:
+                if key in speed:
+                    actual_status[key]["found"] += 1
+                    if oper_status == "up":
+                        actual_status[key]["up"] += 1
+        
+        pre_total_found = sum(val["found"] for val in actual_status.values())
+        pre_up_total = sum(val["up"] for val in actual_status.values())
+
+        logger.info(f"Pre-check: Total ports found: {pre_total_found}")
+        logger.info(f"PRE port count matched: Expected {pre_total_expected}, Found {pre_total_found}, Up={pre_up_total}")
+
+        # LLDP & EEPROM collection
+        logger.info("Checking Pre LLDP/EEPROM before Reboot ")
+        pre_lldp_uut1, pre_eeprom_uut1 = {}, {}
+        for intf in interface_list_uut1:
+            logger.info(f"Collecting PRE LLDP for {intf}")
+            pre_lldp_uut1[intf] = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(pre_lldp_uut1[intf])
+            time.sleep(30)
+
+            logger.info(f"Collecting PRE EEPROM for {intf}")
+            pre_eeprom_uut1[intf] = uut1.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(pre_eeprom_uut1[intf])
+
+        # Save config for reboot 
+        uut1.execute("sudo config save -y")
+
+        #rebooting the switch 1
+        logger.info("Rebooting the device")
+        uut1.execute("sudo reboot")
+
+        #disconnceting after reboot
+        uut1.disconnect()
+        time.sleep(600)
+
+        # Reconnecting after reboot
+        logger.info("Reconnecting to UUT1")
+        uut1.connect(log_stdout=False, learn_hostname=True)
+
+        #again Entering in bash on uut1
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        ##### POST-CHECKS started from here #####
+        logger.info("POST-CHECKS of UUT1")
+        
+        # Post-reboot version
+        post_version = uut1.execute('show version')
+        logger.info("Post-reboot version:\n" + post_version)
+
+        post_version_match = re.search(r'SONiC Software Version:\s*(\S+)', post_version)
+        if not post_version_match:
+            self.failed("SONiC version not found in post-checks")
+        post_sonic_version = post_version_match.group(1)
+    
+
+        # POST-REBOOT of SKU CHECK
+        post_platform_output = uut1.execute("show platform summary")
+        post_sku_match = re.search(r"HwSKU:\s*(\S+)", post_platform_output)
+        if not post_sku_match:
+            self.failed("HwSKU not found in post-checks")
+        post_sku = post_sku_match.group(1)
+        logger.info(f"Detected POST SKU: {post_sku}")
+        
+        sku_map = {
+            "96x25g+8x100-8x200": {"25G": 96, "100G": 8, "200G": 8, "400G": 0},
+            "Nexus-C3432D-32d": {"25G": 0, "100G": 0, "200G": 0, "400G": 32},
+            "Nexus-C3432D-48x200G-32x100G": {"25G": 0, "100G": 32, "200G": 48, "400G": 0},
+            "Nexus-C3432D-48x100G-8x400G": {"25G": 0, "100G": 48, "200G": 0, "400G": 8},
+            "Nexus-C3432D-96x25G-16x200G": {"25G": 96, "100G": 0, "200G": 16, "400G": 0}
+        }
+
+        post_expected_ports = {"25G": 0, "100G": 0, "200G": 0, "400G": 0}
+        for key in sku_map:
+            if key in post_sku:
+                post_expected_ports = sku_map[key]
+                break
+
+        # post_expected_ports = get_expected_ports_from_sku(post_sku)
+        post_total_expected = sum(post_expected_ports.values())
+        logger.info(f"Expected ports from SKU in Post-Reboot: {post_expected_ports}")
+        
+        #post interface status
+        post_intf_output = uut1.execute("show interface status")
+        post_actual_status = {k: {"found": 0, "up": 0} for k in post_expected_ports}
+        for line in post_intf_output.splitlines():
+            if not line.strip() or 'Interface' in line:
+                continue
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            speed, oper_status = fields[2], fields[7].lower()
+            for key in post_actual_status:
+                if key in speed:
+                    post_actual_status[key]["found"] += 1
+                    if oper_status == "up":
+                        post_actual_status[key]["up"] += 1
+        
+        post_total_found = sum(val["found"] for val in post_actual_status.values())
+        post_up_total = sum(val["up"] for val in post_actual_status.values())
+
+        logger.info(f"Post-check: Total ports found: {post_total_found}")
+        logger.info(f"POST port count matched: Expected {post_total_expected}, Found {post_total_found}, Up={post_up_total}")
+        # logger.error(f"post port count not matched as expected")
+        # time.sleep(20)    
+
+        # LLDP and EEPROM validation
+        post_lldp_uut1, post_eeprom_uut1 = {}, {}
+        for intf in interface_list_uut1:
+            logger.info(f"Post-reboot LLDP for {intf}")
+            post_lldp_uut1[intf] = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(post_lldp_uut1[intf])
+            time.sleep(30)
+
+            logger.info(f"Post-reboot EEPROM for {intf}")
+            post_eeprom_uut1[intf] = uut1.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(post_eeprom_uut1[intf])
+        
+        #comparision of pre & post LLDP/EEPROM
+        logger.info("Comparing PRE and POST LLDP/EEPROM values")
+        for intf in interface_list_uut1:
+            if normalize(pre_lldp_uut1[intf]) == normalize(post_lldp_uut1[intf]):
+                logger.info(f"LLDP data is matched between Pre and Post Comparision {intf}")
+            else:    
+                logger.error(f"LLDP MISMATCH on {intf}")
+                self.failed(f"LLDP mismatch on {intf}")
+
+            if normalize(pre_eeprom_uut1[intf]) == normalize(post_eeprom_uut1[intf]):
+                logger.info(f"EEPROM data is matched between Pre and Post Comparision {intf}")
+            else:    
+                logger.error(f"EEPROM MISMATCH on {intf}")
+                self.failed(f"EEPROM mismatch on {intf}")
+
+        time.sleep(10)     
+
+        # Compare pre-check and post-check results
+        if pre_sonic_version == post_sonic_version:
+            logger.info("Version matched between pre and post reboot")
+        else:
+            logger.error("Version mismatch detected")
+            self.failed("Version mismatch detected in final check")   
+
+        # Pre/Post SKU COMPARISON
+        if pre_sku == post_sku:
+            logger.info("Detected SKU matched between pre and post reboot")
+        else:
+            logger.error("SKU mismatch detected")
+            self.failed("SKU mismatch detected in final check")  
+
+        time.sleep(10)            
+
+        # Comparison between PRE and POST port count
+        logger.info("Comparing PRE and POST port counts")
+
+        if pre_total_expected == post_total_expected and pre_total_found == post_total_found and pre_up_total == post_up_total:
+            logger.info(f"PRE port count matched: Expected {pre_total_expected}, Found {pre_total_found}, Up={pre_up_total} and POST port count matched: Expected {post_total_expected}, Found {post_total_found}, Up={post_up_total}")
+            logger.info("Port count matched between PRE and POST reboot")
+        else:
+            logger.error(f"Mismatch in PRE and POST port counts:")
+            logger.error(f"PRE  port count: Expected {pre_total_expected}, Found {pre_total_found}, Up={pre_up_total}")
+            logger.error(f"POST port count: Expected {post_total_expected}, Found {post_total_found}, Up={post_up_total}")
+            self.failed("Port count mismatch between PRE and POST reboot")
+
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass     
+
+
+########################################## TESTCASE 8 ##################################################
+
+
+@aetest.skip
+class TC8_Warm_Reboot_Verify_Status(aetest.Testcase):
+
+    @aetest.test
+    def pre_post_warm_reboot_verify_status(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6):
+        interface_list_uut1 = [uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6]
+
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+        
+        time.sleep(5)
+
+        ##### PRE-CHECKS #####
+        logger.info("PRE-CHECKS of UUT1")
+
+        # Pre-reboot version
+        pre_version = uut1.execute('show version')
+        logger.info("Pre-warm-reboot version:\n" + pre_version)
+
+        pre_version_match = re.search(r'SONiC Software Version:\s*(\S+)', pre_version)
+        if not pre_version_match:
+            self.failed("SONiC version not found in pre-checks")
+        pre_sonic_version = pre_version_match.group(1)
+
+        #pre platform check
+        pre_platform_output = uut1.execute("show platform summary")
+        sku_match = re.search(r"HwSKU:\s*(\S+)", pre_platform_output)
+        if not sku_match:
+            self.failed("HwSKU not found in platform summary")
+        pre_sku = sku_match.group(1)
+        logger.info(f"Detected PRE SKU: {pre_sku}")
+        
+        sku_map = {
+            "96x25g+8x100-8x200": {"25G": 96, "100G": 8, "200G": 8, "400G": 0},
+            "Nexus-C3432D-32d": {"25G": 0, "100G": 0, "200G": 0, "400G": 32},
+            "Nexus-C3432D-48x200G-32x100G": {"25G": 0, "100G": 32, "200G": 48, "400G": 0},
+            "Nexus-C3432D-48x100G-8x400G": {"25G": 0, "100G": 48, "200G": 0, "400G": 8},
+            "Nexus-C3432D-96x25G-16x200G": {"25G": 96, "100G": 0, "200G": 16, "400G": 0}
+        }
+
+        pre_expected_ports = {"25G": 0, "100G": 0, "200G": 0, "400G": 0}
+        for key in sku_map:
+            if key in pre_sku:
+                pre_expected_ports = sku_map[key]
+                break
+
+        # post_expected_ports = get_expected_ports_from_sku(post_sku)
+        pre_total_expected = sum(pre_expected_ports.values())
+        logger.info(f"Expected ports from SKU in Post-Reboot: {pre_expected_ports}")
+        
+        # Interface status
+        intf_output = uut1.execute("show interface status")
+        actual_status = {k: {"found": 0, "up": 0} for k in pre_expected_ports}
+        for line in intf_output.splitlines():
+            if not line.strip() or 'Interface' in line:
+                continue
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            speed, oper_status = fields[2], fields[7].lower()
+            for key in actual_status:
+                if key in speed:
+                    actual_status[key]["found"] += 1
+                    if oper_status == "up":
+                        actual_status[key]["up"] += 1
+        
+        pre_total_found = sum(val["found"] for val in actual_status.values())
+        pre_up_total = sum(val["up"] for val in actual_status.values())
+
+        logger.info(f"Pre-check: Total ports found: {pre_total_found}")
+        logger.info(f"PRE port count matched: Expected {pre_total_expected}, Found {pre_total_found}, Up={pre_up_total}")
+
+        # Timestamp before warm-reboot
+        pre_warm_reboot_timestamp = uut1.execute('date')
+        logger.info(f"Raw date output before warm-reboot: {pre_warm_reboot_timestamp}")
+
+        # Match format: Fri May 30 15:38:05 UTC 2025
+        match = re.search(r'\w+\s+(\w+)\s+(\d{1,2})\s+(\d{2}):(\d{2}):\d{2}\s+\w+\s+\d{4}', pre_warm_reboot_timestamp)
+        if match:
+            pre_warm_reboot_log_time = f"{match.group(1)} {match.group(2)} {match.group(3)}:{match.group(4)}"
+            syslog_date_prefix = f"{match.group(1)} {match.group(2)} {match.group(3)}"
+            logger.info(f"Parsed pre-warm-reboot log timestamp: {pre_warm_reboot_log_time}")
+        else:
+            logger.error("Unable to parse pre-warm--reboot timestamp")
+            self.failed("Unable to parse pre-warm-reboot timestamp")
+
+
+        # Save counters before reboot
+        logger.info("Collecting interface counters BEFORE warm-reboot")
+        pre_counters = uut1.execute("show interface counters")
+        logger.info(f"Interface Counters (PRE):\n{pre_counters}")
+
+        # Clear counters
+        logger.info("Clearing interface counters")
+        uut1.execute("sonic-clear counters")
+
+        # Wait for counters to reset
+        time.sleep(30)
+
+        # Verify counters cleared
+        cleared_counters = uut1.execute("show interface counters")
+        logger.info(f"Interface Counters after clearing:\n{cleared_counters}")
+
+        count_cmd = uut1.execute("show interface counters errors")
+        # Ensure count_cmd is not empty or None
+        if not count_cmd:
+            logger.error("No output returned from 'show interface counters errors' command")
+            self.failed("No output from command")
+        else:
+            # Split the output into individual lines
+            pre_lines = count_cmd.splitlines()
+
+            # Continue processing the lines as required
+            pre_rx_err_found = False
+            pre_tx_err_found = False
+
+            # Skip header lines if necessary, adjust indexing if needed
+            data_lines = pre_lines[14:]
+
+            for line in data_lines:
+                line = line.strip()
+                if not line:
+                    continue  # Skip empty lines
+
+                columns = line.split()
+                if len(columns) >= 15:
+                    rx_err = int(columns[6])   # RX_ERR
+                    tx_err = int(columns[12])  # TX_ERR
+
+                    logger.info(f"[PRE] RX_ERR={rx_err}, TX_ERR={tx_err}")
+
+                    if rx_err == 0:
+                        pre_rx_err_found = True
+                    if tx_err == 0:
+                        pre_tx_err_found = True
+                else:
+                    logger.debug(f"[PRE] Skipping malformed line: {line}")
+
+            # Final check
+            if not (pre_rx_err_found or pre_tx_err_found):
+                logger.info("Counters are 0 for RX_ERR and TX_ERR before warm reboot (as expected)")
+            else:
+                logger.error("Non-zero RX_ERR or TX_ERR found before warm reboot")
+                self.failed("RX_ERR or TX_ERR not cleared before warm reboot")
+
+        # Record the start time just before checking logs
+        start_time = time.time()
+
+        syslog_date_prefix = time.strftime("%b %e %H:%M:%S", time.gmtime(start_time))
+        logger.info(f"Using syslog date prefix: {syslog_date_prefix}")
+
+        timestamp = syslog_date_prefix
+        syslog_cmd = (
+            f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep -c 'oper state set'"
+        )
+
+        logger.info(f"Running flap count command: {syslog_cmd}")
+        count_flaps = uut1.execute(syslog_cmd).strip()
+
+        logger.info(f"Filtered link flap count: {count_flaps}")
+
+        if int(count_flaps) > 0:
+            # Optionally, collect flap log lines for debugging
+            timestamp = syslog_date_prefix
+            syslog_cmd = (
+                f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep -c 'oper state set'"
+            )
+
+            logger.info(f"Collecting link flap logs with: {syslog_cmd}")
+            flap_logs = uut1.execute(syslog_cmd)
+
+            logger.error(
+                f"Link flap detected before warm reboot. Flap count: {count_flaps}. Logs:\n{flap_logs}"
+            )
+        else:
+            logger.info("No link flaps detected before warm reboot")
+
+
+        # LLDP & EEPROM collection
+        logger.info("Checking Pre LLDP/EEPROM before Reboot ")
+        pre_lldp_uut1, pre_eeprom_uut1 = {}, {}
+        for intf in interface_list_uut1:
+            logger.info(f"Collecting PRE LLDP for {intf}")
+            pre_lldp_uut1[intf] = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(pre_lldp_uut1[intf])
+            time.sleep(30)
+
+            logger.info(f"Collecting PRE EEPROM for {intf}")
+            pre_eeprom_uut1[intf] = uut1.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(pre_eeprom_uut1[intf])
+
+        # for Saving the above config
+        uut1.execute("sudo config save -y")
+        time.sleep(5)
+
+        # Send reboot command directly without dialog
+        uut1.spawn.sendline("sudo warm-reboot")
+        time.sleep(5)
+
+        # Disconnect to allowing the reboot thing
+        uut1.disconnect()
+
+        # Wait for warm-reboot to complete
+        time.sleep(600)
+
+        logger.info("Reconnecting to UUT1 after warm-reboot")
+        uut1.connect(log_stdout=False, learn_hostname=True)
+        
+
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        ##### POST-CHECKS ######
+        logger.info("POST-CHECKS of UUT1")
+        
+        # Pre-reboot version
+        post_version = uut1.execute('show version')
+        logger.info("Post-warm-reboot version:\n" + post_version)
+
+        post_version_match = re.search(r'SONiC Software Version:\s*(\S+)', post_version)
+        if not post_version_match:
+            self.failed("SONiC version not found in post-checks")
+        post_sonic_version = post_version_match.group(1)
+        
+        #post platform check
+        post_platform_output = uut1.execute("show platform summary")
+        sku_match = re.search(r"HwSKU:\s*(\S+)", post_platform_output)
+        if not sku_match:
+            self.failed("HwSKU not found in platform summary (post-check)")
+        post_sku = sku_match.group(1)
+        logger.info(f"Detected POST SKU: {post_sku}")
+        
+        sku_map = {
+            "96x25g+8x100-8x200": {"25G": 96, "100G": 8, "200G": 8, "400G": 0},
+            "Nexus-C3432D-32d": {"25G": 0, "100G": 0, "200G": 0, "400G": 32},
+            "Nexus-C3432D-48x200G-32x100G": {"25G": 0, "100G": 32, "200G": 48, "400G": 0},
+            "Nexus-C3432D-48x100G-8x400G": {"25G": 0, "100G": 48, "200G": 0, "400G": 8},
+            "Nexus-C3432D-96x25G-16x200G": {"25G": 96, "100G": 0, "200G": 16, "400G": 0}
+        }
+
+        post_expected_ports = {"25G": 0, "100G": 0, "200G": 0, "400G": 0}
+        for key in sku_map:
+            if key in post_sku:
+                post_expected_ports = sku_map[key]
+                break
+
+        # post_expected_ports = get_expected_ports_from_sku(post_sku)
+        post_total_expected = sum(post_expected_ports.values())
+        logger.info(f"Expected ports from SKU in Post-Reboot: {post_expected_ports}")
+        
+         #post interface status
+        post_intf_output = uut1.execute("show interface status")
+        post_actual_status = {k: {"found": 0, "up": 0} for k in post_expected_ports}
+        for line in post_intf_output.splitlines():
+            if not line.strip() or 'Interface' in line:
+                continue
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            speed, oper_status = fields[2], fields[7].lower()
+            for key in post_actual_status:
+                if key in speed:
+                    post_actual_status[key]["found"] += 1
+                    if oper_status == "up":
+                        post_actual_status[key]["up"] += 1
+        
+        post_total_found = sum(val["found"] for val in post_actual_status.values())
+        post_up_total = sum(val["up"] for val in post_actual_status.values())
+
+        logger.info(f"Post-check: Total ports found: {post_total_found}")
+        logger.info(f"POST port count matched: Expected {post_total_expected}, Found {post_total_found}, Up={post_up_total}")
+        time.sleep(20)    
+
+
+        # Save counters after reboot
+        logger.info("Collecting interface counters AFTER warm-reboot")
+        post_counters = uut1.execute("show interface counters")
+        logger.info(f"Interface Counters (POST):\n{post_counters}")
+
+        # Waiting for the counters to reseting
+        time.sleep(20)
+
+        count_cmd = uut1.execute("show interface counters errors")
+        # Ensure count_cmd is not empty or None
+        if not count_cmd:
+            logger.error("No output returned from 'show interface counters errors' command")
+            self.failed("No output from command")
+        else:
+            # Split the output into individual lines
+            post_lines = count_cmd.splitlines()
+
+            # Continue processing the lines as required
+            post_rx_err_found = False
+            post_tx_err_found = False
+
+            # Skip header lines if necessary, adjust indexing if needed
+            data_lines = post_lines[14:]
+
+            for line in data_lines:
+                line = line.strip()
+                if not line:
+                    continue  # Skip empty lines
+
+                columns = line.split()
+                if len(columns) >= 15:
+                    rx_err = int(columns[6])   # RX_ERR
+                    tx_err = int(columns[12])  # TX_ERR
+
+                    logger.info(f"[POST] RX_ERR={rx_err}, TX_ERR={tx_err}")
+
+                    if rx_err == 0:
+                        post_rx_err_found = True
+                    if tx_err == 0:
+                        post_tx_err_found = True
+                else:
+                    logger.debug(f"[POST] Skipping malformed line: {line}")
+
+            # Final check
+            if not (post_rx_err_found or post_tx_err_found):
+                logger.info("Counters are 0 for RX_ERR and TX_ERR after warm reboot (as expected)")
+            else:
+                logger.error("Non-zero RX_ERR or TX_ERR found after warm reboot")
+                self.failed("RX_ERR or TX_ERR not cleared after warm reboot")
+        
+        # Sleep to simulate wait before checking logs
+        time.sleep(5)  
+
+        # Record the start time just before checking logs
+        start_time = time.time()
+
+
+        # Build the syslog command using your original format
+        syslog_cmd = (
+            f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep -c 'oper state set'"
+        )
+        logger.info(f"Running flap count command: {syslog_cmd}")
+
+        # Execute the command on the device
+        count_flaps = uut1.execute(syslog_cmd).strip()
+        logger.info(f"Filtered link flap count: {count_flaps}")
+
+        # Check flap count and handle accordingly
+        if int(count_flaps) > 0:
+            logger.info("Link flaps detected after warm reboot")
+
+            # Collect the actual flap logs
+            flap_log_cmd = (
+                f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep 'oper state set'"
+            )
+            logger.info(f"Collecting link flap logs with: {flap_log_cmd}")
+            flap_logs = uut1.execute(flap_log_cmd)
+
+            # Simulate test failure
+            self.failed(
+                f"Link flap detected after warm reboot. Flap count: {count_flaps}. Logs:\n{flap_logs}"
+            )
+        else:
+            logger.info("No link flaps detected after warm reboot")
+
+
+        # LLDP and EEPROM validation
+        post_lldp_uut1, post_eeprom_uut1 = {}, {}
+        for intf in interface_list_uut1:
+            logger.info(f"Post-warm-reboot LLDP for {intf}")
+            post_lldp_uut1[intf] = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(post_lldp_uut1[intf])
+            time.sleep(30)
+
+            logger.info(f"Post-warm-reboot EEPROM for {intf}")
+            post_eeprom_uut1[intf] = uut1.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(post_eeprom_uut1[intf])
+
+        #comparision fo the pre & post LLDP/EEPROM
+        logger.info("Comparing PRE and POST LLDP/EEPROM values")
+        for intf in interface_list_uut1:
+            if normalize(pre_lldp_uut1[intf]) == normalize(post_lldp_uut1[intf]):
+                logger.info(f"LLDP data is matched between Pre and Post Comparision {intf}")
+            else:    
+                logger.error(f"LLDP MISMATCH on {intf}")
+                self.failed(f"LLDP mismatch on {intf}")
+
+            if normalize(pre_eeprom_uut1[intf]) == normalize(post_eeprom_uut1[intf]):
+                logger.info(f"EEPROM data is matched between Pre and Post Comparision {intf}")
+            else:    
+                logger.error(f"EEPROM MISMATCH on {intf}")
+                self.failed(f"EEPROM mismatch on {intf}")
+
+        time.sleep(10)        
+
+        if pre_sonic_version == post_sonic_version:
+            logger.info("Version matched between pre and post warm-reboot")
+        else:
+            logger.error("Version mismatch detected")
+            self.failed("Version mismatch detected in final check")   
+
+        # Pre/Post SKU COMPARISION
+        if pre_sku == post_sku:
+            logger.info("Detected SKU matched between pre and post warm-reboot")
+        else:
+            logger.error("SKU mismatch detected")
+            self.failed("SKU mismatch detected in final check") 
+
+        time.sleep(10)    
+
+        # Comparision between the PRE and POST port count
+        logger.info("Comparing PRE and POST port counts")
+
+        if pre_total_expected == post_total_expected and pre_total_found == post_total_found and pre_up_total == post_up_total:
+            logger.info(f"POST port count matched: Expected {post_total_expected}, Found {post_total_found}, Up={post_up_total} and PRE port count matched: Expected {pre_total_expected}, Found {pre_total_found}, Up={pre_up_total}")
+        else:
+            logger.error(f"Mismatch in PRE and POST port counts:")
+            logger.error(f"PRE  port count: Expected {pre_total_expected}, Found {pre_total_found}, Up={pre_up_total}")
+            logger.error(f"POST port count: Expected {post_total_expected}, Found {post_total_found}, Up={post_up_total}")
+            self.failed("Port count mismatch between PRE and POST reboot") 
+
+        # Final decision logic
+        if not (pre_rx_err_found or pre_tx_err_found or post_rx_err_found or post_tx_err_found):
+            logger.info("Counters are cleared correctly and match between pre & post warm reboot")
+        else:
+            logger.error("Counters are not cleared or do not match between pre & post")
+            self.failed("Counters not properly cleared or mismatched after warm reboot")
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass     
+
+
+
+############################################# TESTCASE 9 ###################################################
+
+
+@aetest.skip
+#TESTCASE:8
+class TC9_Multiple_port_flap_Local_Remote(aetest.Testcase):
+    @aetest.test
+    def LLDP_EEPROM_Shut_Port_Validation(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6, uut2, uut2_int1, uut2_int2, uut2_int3, uut2_int4, uut2_int5, uut2_int6):
+        
+        interface_list_uut1 = [uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6]
+        interface_list_uut2 = [uut2_int1, uut2_int2, uut2_int3, uut2_int4, uut2_int5, uut2_int6]
+
+        # Enter bash on uut1
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        
+        # BULK SHUTDOWN on UUT1
+        logger.info("Shutting down all interfaces on UUT1")
+        for intf in interface_list_uut1:
+            uut1.sendline(f"config interface shutdown {intf}")
+            uut1.expect("#")
+        time.sleep(30)
+
+        
+        # VERIFY LINK IS DOWN on BOTH SIDES
+        logger.info("Verifying link is DOWN on UUT1")
+        for intf in interface_list_uut1:
+            output = uut1.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN on UUT1 — expected")
+            else:
+                logger.error(f"{intf} is NOT down on UUT1")
+                self.failed(f"Link still UP on UUT1 for {intf}")
+        # time.sleep(10)        
+
+
+        #verifying link is down on uut2 side
+        logger.info("Verifying link is DOWN on UUT2")
+        remote_interface_list_uut1 = interface_list_uut2
+        for intf in remote_interface_list_uut1:
+            output = uut2.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN on UUT2 — expected")
+            else:
+                logger.error(f"{intf} is NOT down on UUT2")
+                self.failed(f"Link still UP on UUT2 for {intf}")
+        # time.sleep(30)        
+        
+
+        # PER INTERFACE VALIDATION AFTER SHUTDOWN & STARTUP
+        # Per-interface validation loop
+        for i, intf in enumerate(interface_list_uut1):
+            remote_intf = interface_list_uut2[i]
+
+        # for intf in interface_list_uut1:
+            logger.info(f"\n==== Testing Interface {intf} on UUT1 ====")
+
+            logger.info(f"Starting up interface {intf}")
+            uut1.sendline(f"config interface startup {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+
+            logger.info(f"Checking link status of {intf} after startup")
+            output = uut1.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up after startup")
+            time.sleep(30)
+            
+            #UUT1 pre LLDP/EEPROM
+            # PRE-CHECK LLDP
+            logger.info("Capturing pre-flap LLDP on UUT1")
+            time.sleep(30)
+            pre_lldp_uut1 = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if pre_lldp_uut1.strip():
+                logger.info(f"Pre-flap LLDP data for {intf}:\n{pre_lldp_uut1}")
+            else:
+                logger.warning(f"LLDP output missing expected fields for {intf}:\n{pre_lldp_uut1}")
+            time.sleep(30)
+            
+            #PRE EEPROM
+            logger.info("Capturing EEPROM data before flap")
+            pre_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {intf}")
+            if any(field in pre_eeprom_uut1 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM Data Pre-Flap:\n{pre_eeprom_uut1}")
+            else:
+                logger.warning(f"EEPROM fields missing pre-flap on {intf}:\n{pre_eeprom_uut1}")
+
+            time.sleep(30)    
+                       
+            #remote interface checking of uut2 in pre lldp
+            pre_lldp_uut2 = uut2.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            logger.info(f"Pre-flap LLDP data for {remote_intf}:\n{pre_lldp_uut2}")
+            if pre_lldp_uut2.strip():
+                logger.info(f"Pre-flap LLDP data for {intf}:\n{pre_lldp_uut2}")
+            else:
+                logger.warning(f"LLDP output missing expected fields for {intf}:\n{pre_lldp_uut2}")
+            time.sleep(30)
+
+            #remote interface checking of uut2 in pre EEPROM
+            pre_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {remote_intf}")
+            if any(field in pre_eeprom_uut2 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM read successful for {remote_intf}:\n{pre_eeprom_uut2}")
+            else:
+                logger.warning(f"EEPROM output missing for {remote_intf}")
+            
+            #Again shutting down the interface
+            logger.info(f"Shutting down {intf}")
+            uut1.sendline(f"config interface shutdown {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+            
+            #checking link is up or not
+            logger.info(f"Checking link status of {intf} after shutdown")
+            output = uut1.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN after shutdown")
+            else:
+                logger.warning(f"{intf} is NOT down after shutdown")
+            time.sleep(30)
+
+            #is LLDP showing any data or not
+            lldp_after_down = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if not lldp_after_down.strip():
+                logger.info(f"No LLDP data found on {intf} after shutdown — expected")
+            else:
+                logger.warning(f"LLDP data still present after shutdown:\n{lldp_after_down}")
+
+            # Validate LLDP loss on UUT2 after UUT1 interface shutdown
+            logger.info(f"Validating LLDP loss on UUT2 for remote interface {remote_intf} after shutting down the corresponding interface on UUT1")
+            lldp_remote_check = uut2.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+
+            # Cross-check LLDP and EEPROM on UUT1 while UUT2 interface is down
+            logger.info(f"Verifying LLDP and EEPROM data on UUT1 for interface {intf} while the corresponding interface on UUT2 is shut down")
+            lldp_cross_check = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            eeprom_cross_check = uut1.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(f"Cross-check LLDP on UUT1:\n{lldp_cross_check}")
+            logger.info(f"Cross-check EEPROM on UUT1:\n{eeprom_cross_check}")
+
+            #uut1 link up need to be UP again
+            logger.info(f"Starting up {intf} again on UUT1")
+            uut1.sendline(f"config interface startup {intf}")
+            uut1.expect("#")
+            time.sleep(30)
+            
+            #checking the link is up or not
+            logger.info(f"Checking link status of {intf} post-startup")
+            output = uut1.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP post-startup")
+            else:
+                logger.warning(f"{intf} is NOT up post-startup")
+
+            time.sleep(30)
+
+            # LLDP post-check on UUT1
+            logger.info("Capturing LLDP neighbors before flapping")
+            time.sleep(30)
+            post_lldp_uut1 = uut1.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if post_lldp_uut1.strip():
+                logger.info(f"LLDP Data Post-Flap:\n{post_lldp_uut1}")
+            else:
+                logger.warning(f"No LLDP data found on {intf} before flap")
+
+            time.sleep(30)
+
+            # EEPROM post-check
+            logger.info("Capturing EEPROM data before flap")
+            post_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {intf}")
+            if any(field in post_eeprom_uut1 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM Data Post-Flap:\n{post_eeprom_uut1}")
+            else:
+                logger.warning(f"EEPROM fields missing post-flap on {intf}:\n{post_eeprom_uut1}")
+            
+            
+            #comparision check for uut1 of pre/post (LLDP & EEPROM)
+            if normalize(pre_eeprom_uut1) == normalize(post_eeprom_uut1):
+                logger.info("EEPROM data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("EEPROM MISMATCHED")
+                self.failed("EEPROM mismatch")
+
+            if normalize(pre_lldp_uut1) == normalize(post_lldp_uut1):
+                logger.info("LLDP data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("LLDP MISMATCHED")
+                self.failed("LLDP mismatch")
+
+        uut1.sendline("exit")
+        uut1.expect("admin@.*~\$")
+
+        ################## UUT2 Side Validation ##############################
+
+        #interace list to make it shutdown the interfaces
+        interface_list_uut1 = [uut1_int1, uut1_int2, uut1_int3]
+        interface_list_uut2 = [uut2_int1, uut2_int2, uut2_int3]
+
+        logger.info("Entering bash shell on UUT2")
+        uut2.sendline("sudo bash")
+        uut2.expect("root@.*#")
+        
+        #shutting down the interfaces in UUT2
+        logger.info("Shutting down all interfaces on UUT2")
+        for intf in interface_list_uut2:
+            uut2.sendline(f"config interface shutdown {intf}")
+            uut2.expect("#")
+        time.sleep(30)
+        
+        #link is down on uut2 side
+        logger.info("Verifying link is DOWN on UUT2")
+        for intf in interface_list_uut2:
+            output = uut2.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN on UUT2 — expected")
+            else:
+                logger.error(f"{intf} is NOT down on UUT2")
+                self.failed(f"Link still UP on UUT2 for {intf}")
+        # time.sleep(10)        
+        
+        #verifying link is down on uut1 side 
+        logger.info("Verifying link is DOWN on UUT1")
+        remote_interface_list_uut2 = interface_list_uut1
+        for intf in remote_interface_list_uut2:
+            output = uut1.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN on UUT1 — expected")
+            else:
+                logger.error(f"{intf} is NOT down on UUT1")
+                self.failed(f"Link still UP on UUT1 for {intf}")
+        # time.sleep(30)        
+
+
+        
+        # PER INTERFACE VALIDATION AFTER SHUTDOWN & STARTUP
+        # Per-interface validation loop
+        for i, intf in enumerate(interface_list_uut2):
+            remote_intf = interface_list_uut1[i]
+
+        # for intf in interface_list_uut1:
+            logger.info(f"\n==== Testing Interface {intf} on UUT2 ====")
+
+            logger.info(f"Starting up interface {intf}")
+            uut2.sendline(f"config interface startup {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+            
+            #Checking link is up or not
+            logger.info(f"Checking link status of {intf} after startup")
+            output = uut2.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP after startup")
+            else:
+                logger.warning(f"{intf} is NOT up after startup")
+
+            time.sleep(30)
+            
+            
+            #uut2 PRE LLDP/EEPROM
+            # PRE-CHECK LLDP
+            logger.info("Capturing pre-flap LLDP on UUT2")
+            time.sleep(30)
+            pre_lldp_uut2 = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if pre_lldp_uut2.strip():
+                logger.info(f"Pre-flap LLDP data for {intf}:\n{pre_lldp_uut2}")
+            else:
+                logger.warning(f"LLDP output missing expected fields for {intf}:\n{pre_lldp_uut2}")
+
+            time.sleep(30)
+
+            # PRE-CHECK EEPROM
+            logger.info("Capturing pre-flap EEPROM on UUT2")
+            time.sleep(30)
+            pre_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {intf}")
+            if any(field in pre_eeprom_uut2 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM data successfully found for {intf}:\n{pre_eeprom_uut2}")
+            else:
+                logger.warning(f"EEPROM output missing expected fields for {intf}:\n{pre_eeprom_uut2}")
+
+            time.sleep(30)    
+
+            #pre lldp check for remote interface
+            # remote_intf = [uut1_int1, uut1_int2, uut1_int3]
+            pre_lldp_uut1 = uut1.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            logger.info(f"Pre-flap LLDP data for {remote_intf}:\n{pre_lldp_uut1}")
+            if pre_lldp_uut1.strip():
+                logger.info(f"Pre-flap LLDP data for {intf}:\n{pre_lldp_uut1}")
+            else:
+                logger.warning(f"LLDP output missing expected fields for {intf}:\n{pre_lldp_uut1}")
+            time.sleep(30)
+
+            #pre EEprom check for remote interface
+            pre_eeprom_uut1 = uut1.execute(f"show interface transceiver eeprom {remote_intf}")
+            if any(field in pre_eeprom_uut1 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM data successfully found for {remote_intf}:\n{pre_eeprom_uut1}")
+            else:
+                logger.warning(f"EEPROM output missing for {remote_intf}")
+            
+            #again shutting down the interfaces
+            logger.info(f"Shutting down {intf}")
+            uut2.sendline(f"config interface shutdown {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+            
+            #interface down on uut2
+            output = uut2.execute(f"show interface status {intf}")
+            if "down" in output.lower():
+                logger.info(f"{intf} is DOWN after shutdown")
+            else:
+                logger.warning(f"{intf} is NOT down after shutdown")
+            time.sleep(30)    
+
+            
+            #lldp down after shutting down the interfaces
+            lldp_after_down = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            if not lldp_after_down.strip():
+                logger.info(f"No LLDP data found on {intf} after shutdown — expected")
+            else:
+                logger.warning(f"LLDP data still present after shutdown:\n{lldp_after_down}")
+            
+            #checking data loss of lldp after shutting down the interfaces
+            logger.info(f"Validating LLDP loss on UUT1 for {remote_intf}")
+            lldp_remote_check = uut1.execute(f"show lldp neighbors {remote_intf} | grep -v Time")
+            
+            #LLDP & EEPROM validation check
+            logger.info(f"Cross-checking LLDP and EEPROM on UUT2 for {intf}")
+            lldp_cross_check = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            eeprom_cross_check = uut2.execute(f"show interface transceiver eeprom {intf}")
+            logger.info(f"Cross-check LLDP on UUT2:\n{lldp_cross_check}")
+            logger.info(f"Cross-check EEPROM on UUT2:\n{eeprom_cross_check}")
+            
+            #need to make the link up again
+            logger.info(f"Starting up {intf} again on UUT2")
+            uut2.sendline(f"config interface startup {intf}")
+            uut2.expect("#")
+            time.sleep(30)
+
+            output = uut2.execute(f"show interface status {intf}")
+            if "up" in output.lower():
+                logger.info(f"{intf} is UP post-startup")
+            else:
+                logger.warning(f"{intf} is NOT up post-startup")
+            time.sleep(30)
+            
+            #POST LLDP FOR UUT2
+            post_lldp_uut2 = uut2.execute(f"show lldp neighbors {intf} | grep -v Time")
+            logger.info(f"LLDP Data Post-Flap:\n{post_lldp_uut2}")
+            if post_lldp_uut2.strip():
+                 logger.info(f"Post-flap LLDP data for {intf}:\n{post_lldp_uut2}")
+            else:
+                logger.warning(f"LLDP output missing expected fields for {intf}:\n{post_lldp_uut2}")
+            time.sleep(30)
+            
+            #POST EEPROM FOR UUT2
+            post_eeprom_uut2 = uut2.execute(f"show interface transceiver eeprom {intf}")
+            if any(field in post_eeprom_uut2 for field in ["Serial Number", "Vendor", "Part Number"]):
+                logger.info(f"EEPROM Data Post-Flap:\n{post_eeprom_uut2}")
+            else:
+                logger.warning(f"EEPROM fields missing post-flap on {intf}:\n{post_eeprom_uut2}")
+            
+            #Comparision of PRE/POST -> LLDP&EEPROM
+            if normalize(pre_eeprom_uut2) == normalize(post_eeprom_uut2):
+                logger.info("EEPROM data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("EEPROM MISMATCHED")
+                self.failed("EEPROM mismatch")
+            
+            #LLDP comaprision
+            if normalize(pre_lldp_uut2) == normalize(post_lldp_uut2):
+                logger.info("LLDP data is matched between pre-flap and post-flap states")
+            else:
+                logger.error("LLDP MISMATCHED")
+                self.failed("LLDP mismatch")
+
+        uut2.sendline("exit")
+        uut2.expect("admin@.*~\$")
+
+
+
+############################################ TESTCASE 10 ##############################################
+
+
+# @aetest.skip
+class TC10_Validate_Freq_Upgrade_On_HighSpeed_SKUs(aetest.Testcase):
+    @aetest.test
+    def validate_freq_upgrade_on_HighSpeed_SKUs(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6):
+        logger.info("Checking SKU values with NOTCONFIGURED && 10.5 MHz freq upgrade")
+
+        # Enter bash on uut1
+        logger.info("Entering bash shell on UUT1")
+        uut1.sendline("sudo bash")
+        uut1.expect("root@.*#")
+
+        # Step 1: Capture version
+        pre_version = uut1.execute('show version')
+        pre_version_match = re.search(r'SONiC Software Version:\s*(\S+)', pre_version)
+        if not pre_version_match:
+            self.failed("SONiC version not found in pre-checks")
+        pre_sonic_version = pre_version_match.group(1)
+
+        # Step 2: Get SKU
+        pre_platform_output = uut1.execute("show platform summary")
+        pre_sku_match = re.search(r"HwSKU:\s*(\S+)", pre_platform_output)
+        if not pre_sku_match:
+            self.failed("HwSKU not found in pre-checks")
+        pre_sku = pre_sku_match.group(1)
+        logger.info(f"Detected PRE SKU: {pre_sku}")
+
+        # SKU to devport mapping
+        sku_devport_selection = {
+            "Nexus-C3432D-32d": [241, 249, 233, 225, 217, 209, 41, 33, 25, 17, 9, 1],
+            "Nexus-C3432D-48x100G-8x400G": [241, 249, 233, 225, 217, 209, 41, 33, 25, 17, 9, 1],
+            "Nexus-C3432D-48x200G-32x100G": [241, 249, 233, 225, 217, 209, 41, 33, 25, 17, 9, 1],
+            "Nexus-C3432D-96x25G-16x200G":[241, 249, 233, 225, 217, 209, 41, 33, 25, 17, 9, 1]
+        }
+        selected_ports = sku_devport_selection.get(pre_sku, [])
+
+        
+        # Step 3: Parse interfaces for devport speeds
+        output = uut1.execute('show interfaces status')
+        devport_speed_map = {}
+        for line in output.splitlines():
+            if 'Ethernet' in line:
+                match = re.search(r'(Ethernet\d+)\s+([\d,]+)\s+(\d+G)', line)
+                if match:
+                    lanes = match.group(2)
+                    speed = match.group(3)
+                    devport = int(lanes.split(',')[0])
+                    devport_speed_map[devport] = speed
+
+        # Step 4: Enter ivmshell
+        uut1.execute('ivmshell')
+        # Step 5: Check each devport
+        for devport in selected_ports:
+            logger.info(f"\nChecking devport {devport}")
+            ivm_output = uut1.execute(f'ifcs show devport {devport}')
+            speed = devport_speed_map.get(devport, 'UNKNOWN')
+
+            sig_mode = re.search(r'sig_det_mode\s+:\s+(\w+)', ivm_output)
+            pll_freq = re.search(r'tx_pll_bw_freq\s+:\s+([\w\d_]+)', ivm_output)
+
+            sig_val = sig_mode.group(1) if sig_mode else 'UNKNOWN'
+            pll_val = pll_freq.group(1) if pll_freq else 'UNKNOWN'
+
+            if speed == '100G, 200G, 400G' :
+                # Determine expected values based on platform
+                if pre_platform_output == 'PlatformA':
+                    expected_sig_mode = 'MODE2'
+                    expected_pll_freq = 'NOTCONFIGURED'
+                else:
+                    expected_sig_mode = 'MODE1'
+                    expected_pll_freq = '10_5MHZ'
+
+                # Log expected and actual values
+                logger.debug(f"Expected for 400G: sig_det_mode={expected_sig_mode}, tx_pll_bw_freq={expected_pll_freq}")
+                logger.debug(f"Actual: sig_det_mode={sig_val}, tx_pll_bw_freq={pll_val}")
+
+                if sig_val == expected_sig_mode and pll_val == expected_pll_freq:
+                    logger.info(f"[PASS] sig_det_mode:{sig_val} && tx_pll_bw_freq:{pll_val} set correctly on devport {devport}")
+                else:
+                    logger.error(f"[FAIL] sig_det_mode:{sig_val} && tx_pll_bw_freq:{pll_val} NOT set correctly on devport {devport}")
+                    self.failed(f"[FAIL] Devport {devport}: sig_det_mode:{sig_val} && tx_pll_bw_freq:{pll_val} NOT set correctly")
+            else:
+                logger.info(f"Skipping devport {devport} with speed {speed}")   
+
+        logger.info(f"\nConfigurations for the following devports have been verified and set correctly")
+
+        # --- Corrected Exit Sequence ---
+        # 1. Exit syncd container's bash shell
+        logger.info("Exiting 'syncd' docker container's bash shell")
+        uut1.sendline("exit")
+        # After exiting the container, you should return to the device's root shell
+        uut1.expect("root@.*#") # Expect to be back in host's root shell
+
+        # # 2. Exit device's root shell and return to normal admin shell
+        # logger.info("Exiting root shell on UUT2 and returning to admin shell")
+        # uut1.sendline("exit")
+        # # This should now correctly return to the admin prompt, and then the device will auto-logout.
+        # uut1.expect("admin@.*\\$")
+        # # --- End of Corrected Exit Sequence --- 
+
+
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass
+
+
+#################################################### TESTCASE 11 ######################################################
+
+
+# @aetest.skip                       
+######## BUGID for this Testcase: CSCwo68080 ###################### 
+class TC11_Environment_Temperature_Threshold_FanDirection(aetest.Testcase):
+    @aetest.test
+    def checking_environment_temperature_threshold_fandirection(self, uut2, uut2_int1, uut2_int2, uut2_int3):
+
+        logger.info("Checking Environment temperture threshold fan direction")
+        
+        # Enter bash on uut1
+        logger.info("Entering bash shell on UUT2")
+        uut2.sendline("sudo bash")
+        uut2.expect("root@.*#")
+
+        # version checking
+        command_pre_version = f"show version"
+        uut2.execute("show version")
+
+        # Run show platform fan
+        fan_output = uut2.execute("show platform fan")
+
+        # Extract direction from the first fan (assuming consistent direction) by using regex 
+        fan_direction_match = re.search(r'FAN\s+\d-\d\s+\d+%\s+(exhaust|intake)', fan_output)
+        if not fan_direction_match:
+            logger.info("Could not determine fan direction")
+            exit(1)
+
+        direction = fan_direction_match.group(1).strip().lower()
+        logger.info(f"Fan direction: {direction}")
+
+        # Run temperature command
+        logger.info("Checking temperature thresholds...")
+        temp_output = uut2.execute("show platform temperature")
+
+        # Extract temperature threshold table values
+        temp_table = {}
+        for line in temp_output.splitlines():
+            parts = re.split(r'\s{2,}', line.strip())
+            if len(parts) >= 7 and parts[0] in ["BACK (D1)", "FRONT (D1)"]:
+                temp_table[parts[0]] = {
+                    "high_th": int(parts[2]),
+                    "crit_high_th": int(parts[4])
+                }
+
+        # expected thresholds
+        if direction == "exhaust":
+            expected = {
+                "BACK (D1)": {"high_th": 42, "crit_high_th": 70},
+                "FRONT (D1)": {"high_th": 70, "crit_high_th": 80}
+            }
+        elif direction == "intake":
+            expected = {
+                "BACK (D1)": {"high_th": 70, "crit_high_th": 80},
+                "FRONT (D1)": {"high_th": 42, "crit_high_th": 70}
+            }
+        else:
+            logger.info(f"Unknown direction: {direction}")
+            exit(1)
+
+        # Validate thresholds
+        status = True
+        for sensor in expected:
+            actual = temp_table.get(sensor)
+            if not actual:
+                logger.info(f"{sensor} data not found in output")
+                status = False
+                continue
+
+            if actual == expected[sensor]:
+                logger.info(f"Temperature thresholds on {sensor} matched: "
+                            f"Expected: {{High: {expected[sensor]['high_th']}, Critical High: {expected[sensor]['crit_high_th']}}}, "
+                            f"Found: {{High: {actual['high_th']}, Critical High: {actual['crit_high_th']}}}")
+            else:
+                logger.warning(f"Temperature thresholds on {sensor} mismatched: "
+                            f"Expected: {{High: {expected[sensor]['high_th']}, Critical High: {expected[sensor]['crit_high_th']}}}, "
+                            f"Found: {{High: {actual['high_th']}, Critical High: {actual['crit_high_th']}}}")
+                status = False
+
+            # if actual == expected[sensor]:
+            #     logger.info(f"Matched in {sensor}: expected {expected[sensor]}, got {actual}")
+            # else:
+            #     status = False
+
+        # Final result
+        if status:
+            logger.info(f"Temperature thresholds are set correctly as per FAN direction protside ({direction.capitalize()})")
+        else:
+            logger.info(f"Not all temperature thresholds match expected values for FAN direction protside ({direction.capitalize()})")
+            self.failed(f"Temperature thresholds is not matching as expected values for FAN direction of protside ({direction.capitalize()})")
+
+        # time.sleep(300)
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass
+
+
+
+#############################################TESTCASE 12 ################################################
+
+
+# @aetest.skip
+class TC12_Verify_SNR_Check(aetest.Testcase):
+
+    @aetest.test
+    def verify_snr_values_check(self, uut2, uut2_int1, uut2_int2, uut2_int3):
+        """
+        Check SNR values for UP ports only. Acceptable if all values are 0 or non-zero values are ≤ 4.
+        """
+
+        # Define retimer interfaces and their front panel mappings
+        interface_to_fp = {
+            "Ethernet0": 1, "Ethernet8": 2, "Ethernet16": 3, "Ethernet24": 4,
+            "Ethernet32": 5, "Ethernet40": 6,
+            "Ethernet208": 27, "Ethernet224": 29, "Ethernet": 232, 
+            "Ethernet240": 30, "Ethernet248": 31
+        }
+
+        # Step 1: Get interface status for all relevant ports
+        interfaces = "Ethernet0,Ethernet8,Ethernet16,Ethernet24,Ethernet32,Ethernet40,Ethernet208,Ethernet224,Ethernet232,Ethernet240,Ethernet248"
+        logger.info("Checking interface status for UP ports")
+        status_output = uut2.execute(f"show interfaces status {interfaces} | awk '$8 == \"up\"'")
+
+        up_fp_ports = []
+        for line in status_output.splitlines():
+            match = re.match(r"\s*(Ethernet\d+)", line)
+            if match:
+                intf = match.group(1)
+                try:
+                    eth_num = int(intf.replace("Ethernet", ""))
+                    fp = (eth_num // 8) + 1
+                    up_fp_ports.append((intf, fp))
+                except ValueError:
+                    logger.warning(f"Could not parse interface number from {intf}")
+
+
+        logger.info(f"Interfaces UP and mapped to FP ports: {up_fp_ports}")
+        time.sleep(10)
+
+        # Step 2: Enter bash and syncd container
+        logger.info("Entering bash shell on UUT2")
+        uut2.sendline("sudo bash")
+        uut2.expect("root@.*#")
+
+        logger.info("Entering 'syncd' docker container")
+        uut2.execute("docker exec -it syncd bash")
+
+        time.sleep(20)
+
+        # uut2.expect("root@.*#")
+
+        # Step 3: SNR check for UP interfaces
+        snr_summary = {}
+
+        for intf, fp in up_fp_ports:
+            logger.info(f"Collecting SNR values for {intf} (FP {fp})")
+            snr_output = uut2.execute(f"/usr/bin/sonic_inphi_vega_sdk_app --cmd snr --fp {fp}")
+            logger.debug(f"SNR output for {intf}:\n{snr_output}")
+
+            snr_values = re.findall(r"Channel \d+ = ([\d.]+)", snr_output)
+            if not snr_values or len(snr_values) < 16:
+                snr_summary[intf] = "FAILED - Incomplete SNR data"
+                self.failed(f"{intf}: Incomplete SNR data")
+                continue
+
+            snr_values = list(map(float, snr_values))
+            line_side_1 = snr_values[:8]
+            host_side_4 = snr_values[8:16] 
+
+            logger.info(f"Validating Line Side 1 SNR values for {intf}")
+            line_side_valid = True
+
+            for i, val in enumerate(line_side_1):
+                if val == 0.0:
+                    logger.info(f"{intf} - Line Side 1 - Channel {i}: Value {val} is 0.00 — Acceptable")
+                elif val > 20.0:
+                    logger.info(f"{intf} - Line Side 1 - Channel {i}: Value {val} is in acceptable range")
+                else:
+                    logger.warning(f"{intf} - Line Side 1 - Channel {i}: Value {val} ≤ 20.0 — Not acceptable")
+                    line_side_valid = False
+
+
+
+            logger.info(f"Validating Host Side 4 SNR values for {intf}")
+            host_side_valid = True
+
+            for i, val in enumerate(host_side_4):
+                if val == 0.0:
+                    logger.info(f"{intf} - Host Side 4 - Channel {i}: Value {val} is 0.00 — Acceptable")
+                elif val > 20.0:
+                    logger.info(f"{intf} - Host Side 4 - Channel {i}: Value {val} is in acceptable range")
+                else:
+                    logger.warning(f"{intf} - Host Side 4 - Channel {i}: Value {val} ≤ 20.0 — Not acceptable")
+                    host_side_valid = False
+
+
+            # Final validation result
+            snr_valid = line_side_valid and host_side_valid
+
+            if snr_valid:
+                snr_summary[intf] = logger.info(
+                    "PASSED: SNR check is in acceptable range with their Line_Side_1 && Host_Side_4 channel value"
+                )
+            else:
+                snr_summary[intf] = logger.info(
+                    "FAILED: SNR check is NOT in acceptable range with their Line_Side_1 && Host_Side_4 channel value"
+                )
+                # self.failed("SNR check is NOT in acceptable range with their Line_Side_1 && Host_Side_4 channel value")
+     
+                any_failed = True  
+
+        # --- Corrected Exit Sequence ---
+        # 1. Exit syncd container's bash shell
+        logger.info("Exiting 'syncd' docker container's bash shell")
+        uut2.sendline("exit")
+        # After exiting the container, you should return to the device's root shell
+        uut2.expect("root@.*#") # Expect to be back in host's root shell
+
+
+
+
+class common_cleanup(aetest.CommonCleanup):
+
+    @aetest.subsection
+    def disconnect(self, uut2): 
+        # uut1.disconnect()
+        uut2.disconnect()
+                  
+
+
+        # # 2. Exit device's root shell and return to normal admin shell
+        # logger.info("Exiting root shell on UUT2 and returning to admin shell")
+        # uut2.sendline("exit")
+        # # This should now correctly return to the admin prompt, and then the device will auto-logout.
+        # uut2.expect("admin@.*\\$")
+        # # --- End of Corrected Exit Sequence --- 
+
+
+    # @aetest.cleanup
+    # def config_cleanup(self, uut1, uut2):
+    #     pass     
+
+
+################################# ROUGH TESTCASE OF 13 ########################################################
+
+
+# @aetest.skip
+# class TC14_Checking_Longevity_Test(aetest.Testcase):
+
+#     @aetest.test
+#     def checking_longetivity_test(self, uut1, uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6):
+#         interface_list_uut1 = [uut1_int1, uut1_int2, uut1_int3, uut1_int4, uut1_int5, uut1_int6]
+
+#         # # Let's assume 'shell' works and leads to 'admin@.*\\$' prompt.
+#         # logger.info("Attempting to transition from IVM-R> to Linux shell on UUT1")
+#         # uut1.sendline("shell") # Replace 'shell' with the actual command that works on your device
+#         # uut1.expect("admin@.*\\$") # Expect the admin shell prompt after 'shell' command
+#         # logger.info("Successfully transitioned to Linux admin shell on UUT1")
+#         # # --- End of IVM-R> transition ---
+
+#         logger.info("Entering bash shell on UUT1")
+#         uut1.sendline("sudo bash")
+#         uut1.expect("root@.*#")
+
+#         logger.info("Performing PRE-CHECKS...")
+
+#         # Version Check
+#         pre_version_output = uut1.execute("show version")
+#         pre_version_match = re.search(r"SONiC Software Version:\s*(\S+)", pre_version_output)
+#         if not pre_version_match:
+#             self.failed("Failed to detect SONiC version in pre-check")
+#         pre_version = pre_version_match.group(1)
+#         logger.info(f"Pre-Check Version: {pre_version}")
+
+#         # SKU Detection
+#         pre_sku_output = uut1.execute("show platform summary")
+#         pre_sku_match = re.search(r"HwSKU:\s*(\S+)", pre_sku_output)
+#         if not pre_sku_match:
+#             self.failed("Failed to detect SKU in pre-check")
+#         pre_sku = pre_sku_match.group(1)
+#         logger.info(f"Pre-Check SKU: {pre_sku}")
+
+#         # Interface Status
+#         pre_interface_status = uut1.execute("show interface status")
+#         pre_up_count, pre_down_count = 0, 0
+#         for line in pre_interface_status.splitlines():
+#             if "Ethernet" in line:
+#                 fields = line.split()
+#                 if len(fields) >= 8 and fields[7].lower() == "up":
+#                     pre_up_count += 1
+#                 elif len(fields) >= 8 and fields[7].lower() == "down":
+#                     pre_down_count += 1
+#         logger.info(f"Pre-Check Interface Status: {pre_up_count} UP, {pre_down_count} DOWN")
+
+
+#         # Step: Check BPS values are increasing for 'grep U' and 'grep D'
+#         logger.info("Capturing initial BPS values for 'grep U' and 'grep D'")
+#         pre_initial_bps_output_u = uut1.execute("show interface counters | grep U")
+#         pre_initial_bps_output_d = uut1.execute("show interface counters | grep D")
+
+#         time.sleep(60)
+#         logger.info("Capturing BPS values after wait for 'grep U' and 'grep D'")
+#         pre_later_bps_output_u = uut1.execute("show interface counters | grep U")
+#         pre_later_bps_output_d = uut1.execute("show interface counters | grep D")
+
+#         # Parse initial BPS for 'grep U'
+#         initial_bps_u = {}
+#         for line in pre_initial_bps_output_u.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 pre_rx_bps = float(parts[8])
+#                 pre_tx_bps = float(parts[9])
+#                 initial_bps_u[iface] = (pre_rx_bps, pre_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+#         # Parse initial BPS for 'grep D'
+#         initial_bps_d = {}
+#         for line in pre_initial_bps_output_d.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 pre_rx_bps = float(parts[8])
+#                 pre_tx_bps = float(parts[9])
+#                 initial_bps_d[iface] = (pre_rx_bps, pre_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep D': {line}")
+
+#         # Parse later BPS for 'grep U'
+#         later_bps_u = {}
+#         for line in pre_later_bps_output_u.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 later_rx_bps = float(parts[8])
+#                 later_tx_bps = float(parts[9])
+#                 later_bps_u[iface] = (later_rx_bps, later_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+#         # Parse later BPS for 'grep D'
+#         later_bps_d = {}
+#         for line in pre_later_bps_output_d.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 later_rx_bps = float(parts[8])
+#                 later_tx_bps = float(parts[9])
+#                 later_bps_d[iface] = (later_rx_bps, later_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep D': {line}")
+                
+
+#         logger.info("Starting PRE-CHECK traffic validation...")
+
+#         # --- First Measurement ---
+#         logger.info("Capturing first measurement of traffic counters for pre-check...")
+#         output_1 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+#         # Parse 1st measurement (inline logic)
+#         pre_counters_1 = {}
+#         # Regex pattern to capture interface name, RX_OK, and TX_OK
+#         pattern = re.compile(
+#             r'^(?P<iface>\S+)\s+'         # Interface name
+#             r'\S+\s+'                     # STATE
+#             r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+#             r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+#             r'(?:[\d.,]+%)\s+'            # RX_UTIL
+#             r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+#             r'(?P<tx_ok>[\d,]+)'          # TX_OK
+#         )
+
+#         for line in output_1.splitlines():
+#             match = pattern.match(line.strip())
+#             if match:
+#                 iface = match.group('iface')
+#                 rx_ok = int(match.group('rx_ok').replace(',', ''))
+#                 tx_ok = int(match.group('tx_ok').replace(',', ''))
+#                 pre_counters_1[iface] = {
+#                     'RX_OK': rx_ok,
+#                     'TX_OK': tx_ok
+#                 }
+
+#         logger.info(f"Pre-Check Counters (First Measurement): {pre_counters_1}")
+
+#         # --- Wait ---
+#         logger.info("waiting for 300 seconds")
+#         time.sleep(300)
+
+#         # --- Second Measurement ---
+#         logger.info("Capturing second measurement of traffic counters for pre-check...")
+#         output_2 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+#         # Parse 1st measurement (inline logic)
+#         pre_counters_2 = {}
+#         # Regex pattern to capture interface name, RX_OK, and TX_OK
+#         pattern = re.compile(
+#             r'^(?P<iface>\S+)\s+'         # Interface name
+#             r'\S+\s+'                     # STATE
+#             r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+#             r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+#             r'(?:[\d.,]+%)\s+'            # RX_UTIL
+#             r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+#             r'(?P<tx_ok>[\d,]+)'          # TX_OK
+#         )
+
+#         for line in output_2.splitlines():
+#             match = pattern.match(line.strip())
+#             if match:
+#                 iface = match.group('iface')
+#                 rx_ok = int(match.group('rx_ok').replace(',', ''))
+#                 tx_ok = int(match.group('tx_ok').replace(',', ''))
+#                 pre_counters_2[iface] = {
+#                     'RX_OK': rx_ok,
+#                     'TX_OK': tx_ok
+#                 }
+
+#         logger.info(f"Pre-Check Counters (Second Measurement): {pre_counters_2}")
+
+#         # --- Validation ---
+#         logger.info("Validating traffic counters during pre-check...")
+
+#         success_count = 0
+#         interface_list_uut1 = ["Ethernet8", "Ethernet16", "Ethernet72", "Ethernet184", "Ethernet240", "Ethernet248"]
+
+#         for iface in interface_list_uut1:
+#             rx1 = pre_counters_1.get(iface, {}).get("RX_OK", 0)
+#             rx2 = pre_counters_2.get(iface, {}).get("RX_OK", 0)
+#             tx1 = pre_counters_1.get(iface, {}).get("TX_OK", 0)
+#             tx2 = pre_counters_2.get(iface, {}).get("TX_OK", 0)
+
+#             rx_diff = rx2 - rx1
+#             tx_diff = tx2 - tx1
+
+#             if rx_diff > 0 or tx_diff > 0:
+#                 logger.info(f"[SUCCESS] Traffic is running successfully on {iface}: RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+#                 success_count += 1
+#             else:
+#                 logger.error(f"[FAILURE] No traffic activity on {iface} | RX_OK difference: {rx_diff}, TX_OK difference: {tx_diff}")
+
+#         # --- Summary ---
+#         total_interfaces = len(interface_list_uut1)
+#         success_rate = (success_count / total_interfaces) * 100
+#         logger.info(f"Traffic validation success rate: {success_rate:.2f}%")
+
+#         if success_rate < 90.0:
+#             self.failed(f"Traffic validation failed during pre-check. Only {success_rate:.2f}% interfaces passed")
+#         else:
+#             logger.info("Traffic validation passed based on threshold (>=90%)")
+
+
+#         # Save counters before reboot
+#         logger.info("Collecting interface counters BEFORE adding longetivity")
+#         pre_counters = uut1.execute("show interface counters")
+#         logger.info(f"Interface Counters (PRE):\n{pre_counters}")
+
+#         # Clear counters
+#         logger.info("Clearing interface counters")
+#         uut1.execute("sonic-clear counters")
+
+#         # Wait for counters to reset
+#         time.sleep(30)
+
+#         # Verify counters cleared
+#         cleared_counters = uut1.execute("show interface counters")
+#         logger.info(f"Interface Counters after clearing:\n{cleared_counters}")
+
+#         count_cmd = uut1.execute("show interface counters errors")
+#         # Ensure count_cmd is not empty or None
+#         if not count_cmd:
+#             logger.error("No output returned from 'show interface counters errors' command")
+#             self.failed("No output from command")
+#         else:
+#             # Split the output into individual lines
+#             pre_lines = count_cmd.splitlines()
+
+#             # Continue processing the lines as required
+#             pre_rx_err_found = False
+#             pre_tx_err_found = False
+
+
+#             # Skip header lines if necessary, adjust indexing if needed
+#             data_lines = pre_lines[14:]
+
+#             for line in data_lines:
+#                 line = line.strip()
+#                 if not line:
+#                     continue  # Skip empty lines
+
+#                 columns = line.split()
+#                 if len(columns) >= 15:
+#                     rx_err = int(columns[6])   # RX_ERR
+#                     tx_err = int(columns[12])  # TX_ERR
+
+#                     logger.info(f"[PRE] RX_ERR={rx_err}, TX_ERR={tx_err}")
+
+#                     if rx_err == 0:
+#                         pre_rx_err_found = True
+#                     if tx_err == 0:
+#                         pre_tx_err_found = True
+#                 else:
+#                     logger.debug(f"[PRE] Skipping malformed line: {line}")
+
+#             # Final check
+#             if not (pre_rx_err_found or pre_tx_err_found):
+#                 logger.info("Counters are 0 for RX_ERR and TX_ERR before adding longetivity (as expected)")
+#             else:
+#                 logger.error("Non-zero RX_ERR or TX_ERR found before adding longetivity")
+#                 self.failed("RX_ERR or TX_ERR not cleared before adding longetivity") 
+
+#         # PRE-CHECK TIMESTAMP
+#         pre_timestamp = uut1.execute('date')
+#         logger.info(f"Raw date output before checking longevity: {pre_timestamp}")
+
+#         # Match format like: Fri May 30 15:38:05 UTC 2025
+#         match = re.search(r'\w+\s+(\w+)\s+(\d{1,2})\s+(\d{2}):(\d{2}):\d{2}\s+\w+\s+\d{4}', pre_timestamp)
+#         if match:
+#             pre_log_time = f"{match.group(1)} {match.group(2)} {match.group(3)}:{match.group(4)}"
+#             syslog_date_prefix = f"{match.group(1)} {match.group(2)} {match.group(3)}:{match.group(4)}"
+#             logger.info(f"Using syslog date prefix for flap detection: {syslog_date_prefix}")
+#         else:
+#             logger.error("Unable to parse pre_timestamp")
+#             self.failed("Unable to parse pre_timestamp")
+
+#         # Record the start time just before checking logs
+#         start_time = time.time()
+
+#         syslog_date_prefix = time.strftime("%b %e %H:%M:%S", time.gmtime(start_time))
+#         logger.info(f"Using syslog date prefix: {syslog_date_prefix}")
+
+#         timestamp = syslog_date_prefix
+#         syslog_cmd = (
+#             f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep -c 'oper state set'"
+#         )    
+
+        
+#         # for Saving the above config
+#         uut1.execute("sudo config save -y")
+#         time.sleep(5)
+
+#         # Sleep for 30 minutes
+#         logger.info("Sleeping for 30 minutes......")
+#         time.sleep(800)
+
+#         logger.info("Entering bash shell on UUT1")
+#         uut1.sendline("sudo bash")
+#         uut1.expect("root@.*#")
+
+#         logger.info("Performing POST-CHECKS...")
+
+#         # Version Check
+#         post_version_output = uut1.execute("show version")
+#         post_version_match = re.search(r"SONiC Software Version:\s*(\S+)", post_version_output)
+#         if not post_version_match:
+#             self.failed("Failed to detect SONiC version in post-check")
+#         post_version = post_version_match.group(1)
+#         logger.info(f"Post-Check Version: {post_version}")
+
+#         # SKU Detection
+#         post_sku_output = uut1.execute("show platform summary")
+#         post_sku_match = re.search(r"HwSKU:\s*(\S+)", post_sku_output)
+#         if not post_sku_match:
+#             self.failed("Failed to detect SKU in post-check")
+#         post_sku = post_sku_match.group(1)
+#         logger.info(f"Post-Check SKU: {post_sku}")
+
+#         # Interface Status
+#         post_interface_status = uut1.execute("show interface status")
+#         post_up_count, post_down_count = 0, 0
+#         for line in post_interface_status.splitlines():
+#             if "Ethernet" in line:
+#                 fields = line.split()
+#                 if len(fields) >= 8 and fields[7].lower() == "up":
+#                     post_up_count += 1
+#                 elif len(fields) >= 8 and fields[7].lower() == "down":
+#                     post_down_count += 1
+#         logger.info(f"Post-Check Interface Status: {post_up_count} UP, {post_down_count} DOWN")
+
+#         # Traffic Check
+#         # Step: Check BPS values are increasing for 'grep U' and 'grep D'
+#         logger.info("Capturing initial BPS values for 'grep U' and 'grep D'")
+#         post_initial_bps_output_u = uut1.execute("show interface counters | grep U")
+#         post_initial_bps_output_d = uut1.execute("show interface counters | grep D")
+
+#         time.sleep(60)
+#         logger.info("Capturing BPS values after wait for 'grep U' and 'grep D'")
+#         post_later_bps_output_u = uut1.execute("show interface counters | grep U")
+#         post_later_bps_output_d = uut1.execute("show interface counters | grep D")
+
+#         # Parse initial BPS for 'grep U'
+#         initial_bps_u = {}
+#         for line in post_initial_bps_output_u.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 post_rx_bps = float(parts[8])
+#                 post_tx_bps = float(parts[9])
+#                 initial_bps_u[iface] = (post_rx_bps, post_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+#         # Parse initial BPS for 'grep D'
+#         initial_bps_d = {}
+#         for line in post_initial_bps_output_d.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 post_rx_bps = float(parts[8])
+#                 post_tx_bps = float(parts[9])
+#                 initial_bps_d[iface] = (post_rx_bps, post_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep D': {line}")
+
+#         # Parse later BPS for 'grep U'
+#         later_bps_u = {}
+#         for line in post_later_bps_output_u.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 later_rx_bps = float(parts[8])
+#                 later_tx_bps = float(parts[9])
+#                 later_bps_u[iface] = (later_rx_bps, later_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep U': {line}")
+
+#         # Parse later BPS for 'grep D'
+#         later_bps_d = {}
+#         for line in post_later_bps_output_d.splitlines():
+#             parts = line.split()
+#             if len(parts) >= 10 and parts[8].replace('.', '', 1).isdigit() and parts[9].replace('.', '', 1).isdigit():
+#                 iface = parts[0]
+#                 later_rx_bps = float(parts[8])
+#                 later_tx_bps = float(parts[9])
+#                 later_bps_d[iface] = (later_rx_bps, later_tx_bps)
+#             else:
+#                 logger.debug(f"Skipping malformed line for 'grep D': {line}")
+
+
+#         # # POST-CHECK: Traffic Validation
+#         logger.info("Starting POST-CHECK traffic validation...")
+#         # --- First Measurement ---
+#         logger.info("Capturing first measurement of traffic counters for post-check...")
+#         output_1 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+#         # Parse 1st measurement (inline logic)
+#         post_counters_1 = {}
+#         # Regex pattern to capture interface name, RX_OK, and TX_OK
+#         pattern = re.compile(
+#             r'^(?P<iface>\S+)\s+'         # Interface name
+#             r'\S+\s+'                     # STATE
+#             r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+#             r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+#             r'(?:[\d.,]+%)\s+'            # RX_UTIL
+#             r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+#             r'(?P<tx_ok>[\d,]+)'          # TX_OK
+#         )
+
+#         for line in output_1.splitlines():
+#             match = pattern.match(line.strip())
+#             if match:
+#                 iface = match.group('iface')
+#                 rx_ok = int(match.group('rx_ok').replace(',', ''))
+#                 tx_ok = int(match.group('tx_ok').replace(',', ''))
+#                 post_counters_1[iface] = {
+#                     'RX_OK': rx_ok,
+#                     'TX_OK': tx_ok
+#                 }
+
+#         logger.info(f"Post-Check Counters (First Measurement): {post_counters_1}")
+
+#         # --- Wait ---
+#         logger.info("waiting for 300 seconds")
+#         time.sleep(300)
+
+#         # --- Second Measurement ---
+#         logger.info("Capturing second measurement of traffic counters for post-check...")
+#         output_2 = uut1.execute('show interface counters -i "Ethernet8,Ethernet16,Ethernet72,Ethernet184,Ethernet240,Ethernet248"')
+
+#         # Parse 1st measurement (inline logic)
+#         post_counters_2 = {}
+#         # Regex pattern to capture interface name, RX_OK, and TX_OK
+#         pattern = re.compile(
+#             r'^(?P<iface>\S+)\s+'         # Interface name
+#             r'\S+\s+'                     # STATE
+#             r'(?P<rx_ok>[\d,]+)\s+'       # RX_OK
+#             r'(?:[\d.,]+\s+\S+)\s+'       # RX_BPS (with unit like B/s)
+#             r'(?:[\d.,]+%)\s+'            # RX_UTIL
+#             r'\d+\s+\d+\s+\d+\s+'         # RX_ERR, RX_DRP, RX_OVR
+#             r'(?P<tx_ok>[\d,]+)'          # TX_OK
+#         )
+
+#         for line in output_2.splitlines():
+#             match = pattern.match(line.strip())
+#             if match:
+#                 iface = match.group('iface')
+#                 rx_ok = int(match.group('rx_ok').replace(',', ''))
+#                 tx_ok = int(match.group('tx_ok').replace(',', ''))
+#                 post_counters_2[iface] = {
+#                     'RX_OK': rx_ok,
+#                     'TX_OK': tx_ok
+#                 }
+
+#         logger.info(f"Post-Check Counters (Second Measurement): {post_counters_2}")
+
+#         # --- Validation ---
+#         logger.info("Validating traffic counters during post-check...")
+
+#         success_count = 0
+#         interface_list_uut1 = ["Ethernet8", "Ethernet16", "Ethernet72", "Ethernet184", "Ethernet240", "Ethernet248"]
+
+#         for iface in interface_list_uut1:
+#             rx1 = post_counters_1.get(iface, {}).get("RX_OK", 0)
+#             rx2 = post_counters_2.get(iface, {}).get("RX_OK", 0)
+#             tx1 = post_counters_1.get(iface, {}).get("TX_OK", 0)
+#             tx2 = post_counters_2.get(iface, {}).get("TX_OK", 0)
+
+#             rx_diff = rx2 - rx1
+#             tx_diff = tx2 - tx1
+
+#             if rx_diff > 0 or tx_diff > 0:
+#                 logger.info(f"[SUCCESS] Traffic is running successfully on {iface}: RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+#                 success_count += 1
+#             else:
+#                 logger.error(f"[FAILURE] No traffic activity on {iface} | RX_OK difference: {rx_diff}, TX_OK difference: {tx_diff}")
+
+#         # --- Summary ---
+#         total_interfaces = len(interface_list_uut1)
+#         success_rate = (success_count / total_interfaces) * 100
+#         logger.info(f"Traffic validation success rate: {success_rate:.2f}%")
+
+#         if success_rate < 90.0:
+#             self.failed(f"Traffic validation failed during post-check. Only {success_rate:.2f}% interfaces passed.")
+#         else:
+#             logger.info("Traffic validation passed based on threshold (>=90%)")
+                
+
+#         # Interface Errors
+#         post_error_counters = uut1.execute("show interface counters errors")
+#         post_errors = {}
+#         for line in post_error_counters.splitlines():
+#             fields = line.split()
+#             if len(fields) >= 15:
+#                 iface = fields[0]
+#                 rx_err = int(fields[6])
+#                 tx_err = int(fields[12])
+#                 post_errors[iface] = (rx_err, tx_err)
+#         logger.info(f"Post-Check Errors (RX/TX): {post_errors}")
+
+#         # Sleep to simulate wait before checking logs
+#         time.sleep(5)  
+
+#         # Record the start time just before checking logs
+#         start_time = time.time()
+
+
+#         # Build the syslog command using your original format
+#         syslog_cmd = (
+#             f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep -c 'oper state set'"
+#         )
+#         logger.info(f"Running flap count command: {syslog_cmd}")
+
+#         # Execute the command on the device
+#         count_flaps = uut1.execute(syslog_cmd).strip()
+#         logger.info(f"Filtered link flap count: {count_flaps}")
+
+#         # Check flap count and handle accordingly
+#         if int(count_flaps) > 0:
+#             logger.info("Link flaps detected after longetvity check")
+
+#             # Collect the actual flap logs
+#             flap_log_cmd = (
+#                 f"cat /var/log/syslog | awk '$0 >= \"{timestamp}\"' | grep 'oper state set'"
+#             )
+#             logger.info(f"Collecting link flap logs with: {flap_log_cmd}")
+#             flap_logs = uut1.execute(flap_log_cmd)
+
+#             # Simulate test failure
+#             self.failed(
+#                 f"Link flap detected after longetvity check. Flap count: {count_flaps}. Logs:\n{flap_logs}"
+#             )
+#         else:
+#             logger.info("No link flaps detected after longetvity check")
+
+
+#         # Compare pre-check and post-check data
+#         logger.info("Comparing PRE-CHECK and POST-CHECK results...")
+
+#         # 1. Compare Software Version
+#         if pre_version == post_version:
+#             logger.info("Version matched between pre-check and post-check status")
+#         else:
+#             logger.error("Version mismatch detected")
+#             self.failed("Version mismatch between pre-check and post-check status")
+
+#         # 2. Compare SKU
+#         if pre_sku == post_sku:
+#             logger.info("SKU matched between pre-check and post-check status")
+#         else:
+#             logger.error("SKU mismatch detected")
+#             self.failed("SKU mismatch between pre-check and post-check status")
+
+#         # 3. Compare Interface Status
+#         if pre_up_count == post_up_count and pre_down_count == post_down_count:
+#             logger.info("Interface status matched between pre-check and post-check status")
+#         else:
+#             logger.error("Interface status mismatch detected")
+#             self.failed("Interface status mismatch between pre-check and post-check status")
+
+#         # 4. Compare Traffic Data (RX_OK and TX_OK)
+#         logger.info("Validating traffic flow between pre-check and post-check...")
+#         traffic_validation_successful = True
+
+#         for iface in interface_list_uut1:
+#             if iface in pre_counters_2 and iface in post_counters_1:
+#                 pre_rx = pre_counters_2[iface]["RX_OK"]
+#                 pre_tx = pre_counters_2[iface]["TX_OK"]
+#                 post_rx = post_counters_1[iface]["RX_OK"]
+#                 post_tx = post_counters_1[iface]["TX_OK"]
+
+#                 rx_diff = post_rx - pre_rx
+#                 tx_diff = post_tx - pre_tx
+
+#                 if rx_diff > 0 and tx_diff > 0:
+#                     logger.info(f"[SUCCESS] Traffic is consistent for {iface} across pre-check and post-check: "
+#                                 f"RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+#                 else:
+#                     logger.error(f"[FAILURE] Traffic validation failed for {iface}: "
+#                                 f"RX_OK increased by {rx_diff}, TX_OK increased by {tx_diff}")
+#                     traffic_validation_successful = False
+#             else:
+#                 logger.warning(f"Interface {iface} not found in pre-check or post-check data. Skipping traffic validation")
+
+#         if not traffic_validation_successful:
+#             self.failed("Traffic validation failed between pre-check and post-check")
+
+#         logger.info("All checks (version, SKU, interface status, traffic, and errors) completed successfully!")
+
+#         # # 2. Exit device's root shell and return to normal admin shell
+#         # logger.info("Exiting root shell on UUT1 and returning to admin shell")
+#         # uut1.sendline("exit")
+#         # # This should now correctly return to the admin prompt, and then the device will auto-logout.
+#         # uut1.expect("admin@.*\\$")
+#         # --- End of Corrected Exit Sequence ---
+#         # uut2.sendline("exit")
+#         # uut2.expect("admin@.*\\$")
+
+    @aetest.cleanup
+    def config_cleanup(self, uut1, uut2):
+        pass   
+
+
+
+
+
+#####################################################################
+#### COMMON CLEANUP SECTION ###
+#####################################################################
+
+class common_cleanup(aetest.CommonCleanup):
+
+    @aetest.subsection
+    def disconnect(self, uut1, uut2): 
+        uut1.disconnect()
+        uut2.disconnect()
+                  
+
